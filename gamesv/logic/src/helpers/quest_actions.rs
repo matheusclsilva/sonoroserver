@@ -17,7 +17,7 @@ use sonoro_proto::enums::{
 use sonoro_proto::pb::{
     AddGuestNotify, AlertArea, AlertAreaNotify, AudioStatePb, AudioStateUpdateNotify,
     BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify, CommonTagData, ElevatorMoveNotify,
-    EntityAddBubbleNotify, EntityAddDynamicInteractNotify, EntityCommonTagNotify, EntityCtxPb,
+    EnableNearbyTrackingNotify, EntityAddBubbleNotify, EntityAddDynamicInteractNotify, EntityCommonTagNotify, EntityCtxPb,
     EntityPosResetNotify, EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify,
     EntityRemoveInfo, EntityRemoveNotify, EntityStateReadyNotify, FlowActionCtxPb,
     FlowShowEntityNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GameplayCueNotify,
@@ -717,10 +717,7 @@ pub fn execute_action<S: PushSink + ?Sized>(
                 record_progress_int(ctx, &format!("spline_move:{sid}"), i64::from(on), false)?;
             }
         }
-        "EnableNearbyTracking" => {
-            let on = json_bool(params.get("IsEnable")).unwrap_or(true);
-            record_progress_int(ctx, "nearby_tracking:enabled", i64::from(on), false)?;
-        }
+        "EnableNearbyTracking" => apply_enable_nearby_tracking(ctx, quest_id, params),
         "FocusOnMapMark" => {
             if let Some(mt) = params.get("MapMarkType").and_then(Value::as_object) {
                 let qid = json_int(mt.get("QuestId")).unwrap_or(0);
@@ -4005,6 +4002,62 @@ fn resolve_action_entity_cfg_id(scene_opt: Option<&Scene>, params: &Map<String, 
         return Some(oc);
     }
     if param_eid > 0 { Some(param_eid) } else { None }
+}
+
+/// The client has no LevelEvent for EnableNearbyTracking; it only sets
+/// SceneItemNearbyTrackingComponent.EnableTracking from EnableNearbyTrackingNotify
+/// (LevelGamePlayController.OnEnableNearbyTrackingNotify). `ControlType` Other lists config ids;
+/// Self (or no ControlType) is the entity that owns the action.
+fn apply_enable_nearby_tracking<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    owner_id: i32,
+    params: &Map<String, Value>,
+) {
+    let Some(scene) = ctx.scene.as_deref_mut() else {
+        return;
+    };
+    let is_enable = json_bool(params.get("IsEnable")).unwrap_or(true);
+    let control = params.get("ControlType").and_then(Value::as_object);
+    let net_ids: Vec<i64> = match control.and_then(|c| json_str(c.get("Type"))) {
+        None | Some("Self") => nearby_tracking_self_net_id(scene, owner_id).into_iter().collect(),
+        Some("Other") => parse_int_list(control.and_then(|c| c.get("Entities")))
+            .into_iter()
+            .filter_map(|cfg_id| scene.find_entity_net_id_by_config_id(cfg_id))
+            .collect(),
+        Some(_) => Vec::new(),
+    };
+    if net_ids.is_empty() {
+        return;
+    }
+    for &nid in &net_ids {
+        if let Some(storage) = scene.entity_mut(nid)
+            && storage.world_item.nearby_tracking_enable.is_some()
+        {
+            storage.world_item.nearby_tracking_enable = Some(is_enable);
+        }
+    }
+    ctx.sink.push(
+        EnableNearbyTrackingNotify::MSG_ID,
+        &EnableNearbyTrackingNotify {
+            EntityIds: net_ids,
+            IsEnable: is_enable,
+        },
+    );
+}
+
+/// Entity-owned action lists pass the owner config id as `owner_id` (StateChangeBehaviors,
+/// interact options) and/or set `active_flow_owner_entity_id` (interact, trigger, listener).
+fn nearby_tracking_self_net_id(scene: &Scene, owner_id: i32) -> Option<i64> {
+    let flow_owner = scene.active_flow_owner_entity_id;
+    if owner_id > 0 {
+        if flow_owner != 0 && scene.find_config_id_by_net_id(flow_owner) == Some(owner_id) {
+            return Some(flow_owner);
+        }
+        if let Some(nid) = scene.find_entity_net_id_by_config_id(owner_id) {
+            return Some(nid);
+        }
+    }
+    (flow_owner != 0 && scene.entity(flow_owner).is_some()).then_some(flow_owner)
 }
 
 fn apply_toggle_elemental_ability<S: PushSink + ?Sized>(

@@ -5618,3 +5618,118 @@ fn audit_124_get_skill_satisfied_by_captured_phantom_skill_echo() {
         "batch capturing the 200001 Echo must complete quest {QUEST_ID} node {NODE_ID}"
     );
 }
+
+#[test]
+fn audit_125_enable_nearby_tracking_pushes_notify_for_self_and_other_targets() {
+    use sonoro_gamesv_logic::helpers::quest_actions::apply_entity_state_change;
+    use sonoro_proto::pb::EnableNearbyTrackingNotify;
+
+    // Teleport001 103000849 (map 8): template NearbyTrackingComponent {"IsEnable":true,
+    // "TrackingType":{"Type":"Icon","TexturePath":"SmallTeleporter",...}} and
+    // StateChangeBehaviors 关卡.Common.状态.激活 -> EnableNearbyTracking {"IsEnable":false}.
+    const TP_CFG: i32 = 103_000_849;
+
+    fn run(h: &mut TestHarness, events: &mut EventQueue, owner_id: i32, raw: &str) {
+        let act: Value = serde_json::from_str(raw).unwrap();
+        let mut qctx = h.state.quest_context(events);
+        let mut cbs = ActionCallbacks::default();
+        execute_action(&mut qctx, &mut cbs, owner_id, 0, &act).unwrap();
+    }
+    fn notifies(h: &mut TestHarness) -> Vec<EnableNearbyTrackingNotify> {
+        h.drain_decoded::<EnableNearbyTrackingNotify>(EnableNearbyTrackingNotify::MSG_ID)
+    }
+    fn tracking(h: &TestHarness, nid: i64) -> Option<bool> {
+        h.state.scene.as_ref().unwrap().entity(nid).unwrap().world_item.nearby_tracking_enable
+    }
+
+    let mut h = TestHarness::new("audit125", Some(8));
+    let mut events = EventQueue::new();
+    entity_cmd::spawn_with_location(
+        &mut events,
+        h.state.scene.as_mut().unwrap(),
+        &h.state.fs,
+        &h.state.assets,
+        &mut h.state.conn,
+        &h.state.player_components.basic,
+        i64::from(TP_CFG),
+        Some(false),
+        Some(false),
+        Some(8),
+        Some([0.0, 0.0, 0.0]),
+        true,
+    )
+    .expect("spawn teleport");
+    let tp_nid = h
+        .state
+        .scene
+        .as_ref()
+        .unwrap()
+        .find_entity_net_id_by_config_id(TP_CFG)
+        .expect("teleport spawned");
+    assert_eq!(tracking(&h, tp_nid), Some(true));
+    let _ = h.drain_count();
+
+    // StateChangeBehaviors (Self, no ControlType): activating the teleport stops its tracking.
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        apply_entity_state_change(
+            &mut qctx,
+            &ActionCallbacks::default(),
+            TP_CFG,
+            "关卡.Common.状态.激活",
+        )
+        .expect("activate teleport");
+    }
+    assert_eq!(
+        notifies(&mut h),
+        vec![EnableNearbyTrackingNotify {
+            EntityIds: vec![tp_nid],
+            IsEnable: false,
+        }]
+    );
+    assert_eq!(tracking(&h, tp_nid), Some(false));
+
+    // ControlType Other (as in LevelPlay/quest FinishActions): config ids -> net ids;
+    // entities not in the scene are skipped.
+    run(
+        &mut h,
+        &mut events,
+        141_000_006,
+        r#"{"Name":"EnableNearbyTracking","Params":{"IsEnable":true,"ControlType":{"Type":"Other","Entities":[103000849,30750003]}}}"#,
+    );
+    assert_eq!(
+        notifies(&mut h),
+        vec![EnableNearbyTrackingNotify {
+            EntityIds: vec![tp_nid],
+            IsEnable: true,
+        }]
+    );
+    assert_eq!(tracking(&h, tp_nid), Some(true));
+
+    // ControlType Self from a trigger/listener list (owner id 0, owner entity set).
+    h.state.scene.as_mut().unwrap().active_flow_owner_entity_id = tp_nid;
+    run(
+        &mut h,
+        &mut events,
+        0,
+        r#"{"Name":"EnableNearbyTracking","Params":{"IsEnable":false,"ControlType":{"Type":"Self"}}}"#,
+    );
+    h.state.scene.as_mut().unwrap().active_flow_owner_entity_id = 0;
+    assert_eq!(
+        notifies(&mut h),
+        vec![EnableNearbyTrackingNotify {
+            EntityIds: vec![tp_nid],
+            IsEnable: false,
+        }]
+    );
+    assert_eq!(tracking(&h, tp_nid), Some(false));
+
+    // ControlType Other with no entities (23 LevelPlay FinishActions): nothing to send.
+    run(
+        &mut h,
+        &mut events,
+        141_000_006,
+        r#"{"Name":"EnableNearbyTracking","Params":{"IsEnable":false,"ControlType":{"Type":"Other","Entities":[]}}}"#,
+    );
+    assert!(notifies(&mut h).is_empty());
+}
