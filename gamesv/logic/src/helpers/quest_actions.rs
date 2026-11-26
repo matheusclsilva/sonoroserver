@@ -31,7 +31,8 @@ use sonoro_proto::pb::{
     RoleTrialCloseNotify, RoleTrialOpenNotify, Rotator, RoverRogueRoomInfoNotify, SceneAreaState,
     SceneAreaStateNotify, SceneChangeDataLayerNotify, SceneItemMoveTargetInfo,
     SceneItemMoveTargetNotify, SceneItemSplineRuntimeData, SceneSubLevelsChangedNotify,
-    SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify, SummonEntityNotify,
+    SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify, StateChangeActionCtxPb,
+    SummonEntityNotify,
     SyncSceneTimeNotify, TeleportNotify, TeleportUpdateNotify, TemporaryTeleportAllInfoNotify,
     TimeLockInfoNotify, TrialRoleItem, VarDefinePb, VarDefinePbValueOneof, Vector,
     VehicleUpdateEntityNotify, VehicleUpdateNotify, WeatherNotify,
@@ -2073,8 +2074,16 @@ fn execute_entity_state_change_behaviors<S: PushSink + ?Sized>(
         return Ok(());
     }
 
+    let entity_ctx = ctx
+        .scene
+        .as_deref()
+        .and_then(|s| s.find_entity_net_id_by_config_id(entity_cfg_id))
+        .map(|net_id| EntityCtxPb {
+            ConfigId: entity_cfg_id,
+            IncId: net_id,
+        });
     let mut matched_actions = Vec::new();
-    for beh in &esc.StateChangeBehaviors {
+    for (idx, beh) in esc.StateChangeBehaviors.iter().enumerate() {
         let Some(obj) = beh.as_object() else {
             continue;
         };
@@ -2095,6 +2104,19 @@ fn execute_entity_state_change_behaviors<S: PushSink + ?Sized>(
             .or_else(|| obj.get("Actions"))
             .and_then(|v| v.as_array())
         {
+            // SceneItemUtility.HandleSceneItemStateActionByServerNotify runs BehaviorMap[StateIndex],
+            // built in StateChangeBehaviors order (SceneItemStateComponent.cs:118-128).
+            if let Some(entity_ctx) = &entity_ctx {
+                crate::helpers::quest_engine::triggers::push_entity_level_events(
+                    ctx,
+                    GameCtxType::EntityStateChangeAction,
+                    GameCtxPbCtxInfoOneof::StateChangeAction(StateChangeActionCtxPb {
+                        EntityCtx: Some(entity_ctx.clone()),
+                        StateIndex: idx as i32,
+                    }),
+                    acts,
+                );
+            }
             matched_actions.extend(acts.iter().cloned());
         }
     }

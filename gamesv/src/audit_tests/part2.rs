@@ -6627,3 +6627,38 @@ fn audit_132_interact_option_actions_push_normal_interact() {
     let frames = drain_push_frames(&mut h);
     assert!(entity_action_notifies(&frames).is_empty());
 }
+
+#[test]
+fn audit_133_state_change_behaviors_push_entity_state_change_action() {
+    use sonoro_gamesv_logic::helpers::quest_actions::apply_entity_state_change;
+
+    // Gameplay541 109008006 (map 8) StateChangeBehaviors: 0 常态 [SetEntityVisible 109008008
+    // false]; 1 激活 [SetEntityVisible 109008008 true, CameraLookAt].
+    const CFG: i32 = 109_008_006;
+    fn change(h: &mut TestHarness, events: &mut EventQueue, state: &str) -> Vec<(u16, Vec<u8>)> {
+        {
+            let mut qctx = h.state.quest_context(events);
+            apply_entity_state_change(&mut qctx, &ActionCallbacks::default(), CFG, state)
+                .expect("state change");
+        }
+        drain_push_frames(h)
+    }
+
+    let mut h = TestHarness::new("audit133", Some(8));
+    let mut events = EventQueue::new();
+    let nid = spawn_level_entity(&mut h, CFG, EntityType::SceneItem);
+    let _ = h.drain_count();
+
+    // StateIndex is the behavior's index; only the CameraLookAt is the client's.
+    let frames = change(&mut h, &mut events, "关卡.Common.状态.激活");
+    let acts = entity_action_notifies(&frames);
+    assert_eq!(acts.len(), 1, "{acts:?}");
+    assert_eq!(
+        (acts[0].1, acts[0].2, acts[0].3, acts[0].4),
+        (GameCtxType::EntityStateChangeAction, (CFG, nid), 1, (1, 1, 2))
+    );
+
+    // Behavior 0 has no client action.
+    let frames = change(&mut h, &mut events, "关卡.Common.状态.常态");
+    assert!(entity_action_notifies(&frames).is_empty());
+}
