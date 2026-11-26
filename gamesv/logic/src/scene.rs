@@ -253,6 +253,8 @@ pub struct Scene {
     pub plot_saved_cur_role: i32,
     pub plot_saved_slot_role_id: i32,
     pub plot_saved_slot_entity_id: i64,
+    /// Role entities of the Echo (Phantom) group while ChangePhantomFormation is in effect.
+    pub phantom_role_entity_ids: Vec<i64>,
     pub pending_flows: Vec<ScenePendingFlow>,
     pub quest_timers: QuestTimerQueue,
     pub lp_timers: QuestTimerQueue,
@@ -343,6 +345,7 @@ impl Scene {
             plot_saved_cur_role: 0,
             plot_saved_slot_role_id: 0,
             plot_saved_slot_entity_id: -1,
+            phantom_role_entity_ids: Vec::new(),
             pending_flows: Vec::new(),
             quest_timers: QuestTimerQueue::new(),
             lp_timers: QuestTimerQueue::new(),

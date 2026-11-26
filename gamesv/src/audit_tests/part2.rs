@@ -6158,3 +6158,102 @@ fn audit_128_quest_data_actions_push_quest_contexts() {
         .collect();
     assert_eq!(got, vec![(GameCtxType::QuestAcceptAction, FADE_QID, 2, 2, 3)]);
 }
+
+#[test]
+fn audit_129_change_phantom_formation_switches_scene_team_to_echo_group() {
+    use sonoro_proto::pb::{
+        EntityAddNotify, EntityRemoveNotify, SwitchSceneGroupNotify, UpdateGroupFormationNotify,
+    };
+    use sonoro_proto::wire::PbMessage;
+
+    // LevelPlay 141000006 node 2 FinishActions ChangePhantomFormation {FormationId 1,
+    // AppendBuffIds [631410001]}; node 33 FinishActions RestorePhantomFormation.
+    // PhantomFormation 1 = Roles [5001001] (TrialRoleInfo, parent RoleInfo 5001 RoleType 2).
+    const ECHO_ROLE: i32 = 5_001_001;
+    const MOVE_LOCK_BUFF: i64 = 631_410_001;
+    const CHANGE: &str = r#"{"Name":"ChangePhantomFormation","Params":{"FormationId":1,"AppendBuffIds":[631410001]}}"#;
+    const RESTORE: &str = r#"{"Name":"RestorePhantomFormation","Params":{}}"#;
+
+    fn run(h: &mut TestHarness, events: &mut EventQueue, raw: &str) {
+        let act: Value = serde_json::from_str(raw).unwrap();
+        let mut qctx = h.state.quest_context(events);
+        let mut cbs = ActionCallbacks::default();
+        execute_action(&mut qctx, &mut cbs, 141_000_006, 2, &act).unwrap();
+    }
+    fn of<M: PbMessage>(frames: &[(u16, Vec<u8>)], id: u16) -> Vec<(usize, M)> {
+        frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.0 == id)
+            .map(|(i, f)| (i, M::decode(&f.1).unwrap()))
+            .collect()
+    }
+
+    let mut h = TestHarness::new("audit129", Some(8));
+    let mut events = EventQueue::new();
+    // Not in the Echo group yet: Restore does nothing (RevertPhantomTeam needs the Phantom group).
+    run(&mut h, &mut events, RESTORE);
+    assert!(drain_push_frames(&mut h).is_empty());
+
+    run(&mut h, &mut events, CHANGE);
+    let frames = drain_push_frames(&mut h);
+    let added = of::<EntityAddNotify>(&frames, EntityAddNotify::MSG_ID);
+    let (add_pos, echo_pb) = added
+        .iter()
+        .find_map(|(i, n)| n.EntityPbs.iter().find(|e| e.ConfigId == ECHO_ROLE).map(|e| (*i, e)))
+        .expect("EntityAddNotify for the Echo role");
+    let echo_eid = echo_pb.Id;
+    assert!(echo_pb.IsVisible);
+    assert_eq!(echo_pb.PlayerId, 1);
+    let groups = of::<UpdateGroupFormationNotify>(&frames, UpdateGroupFormationNotify::MSG_ID);
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    let (group_pos, group) = &groups[0];
+    assert_eq!(group.GroupFormation.len(), 1);
+    let gf = &group.GroupFormation[0];
+    assert_eq!((gf.PlayerId, gf.CurrentGroupType), (1, 2), "Phantom = ETeamGroupType 2");
+    assert_eq!(gf.FightRoleInfos.len(), 1);
+    let phantom = &gf.FightRoleInfos[0];
+    assert_eq!((phantom.GroupType, phantom.CurRole), (2, ECHO_ROLE));
+    let members: Vec<_> = phantom.FightRoleInfos.iter().map(|r| (r.RoleId, r.EntityId)).collect();
+    assert_eq!(members, vec![(ECHO_ROLE, echo_eid)]);
+    let switches = of::<SwitchSceneGroupNotify>(&frames, SwitchSceneGroupNotify::MSG_ID);
+    assert_eq!(switches.len(), 1);
+    let (switch_pos, switch) = &switches[0];
+    assert_eq!((switch.PlayerId, switch.Group), (1, 2));
+    assert!(add_pos < *group_pos && group_pos < switch_pos, "entity, group data, then switch");
+    let scene = h.state.scene.as_ref().unwrap();
+    assert_eq!(scene.phantom_role_entity_ids, vec![echo_eid]);
+    assert_eq!(scene.entity(echo_eid).map(|s| s.config.config_id), Some(ECHO_ROLE));
+    assert!(h.state.player_components.role.is_trial_role(ECHO_ROLE));
+
+    // AppendBuffIds go on the Echo role.
+    crate::network::connection::drain_event_queue_best_effort(&mut events, &mut h.state);
+    let scene = h.state.scene.as_ref().unwrap();
+    let echo_buffs = scene.entity(echo_eid).and_then(|s| s.buffs.as_ref()).unwrap();
+    assert!(echo_buffs.buffs.iter().any(|b| b.BuffId == MOVE_LOCK_BUFF));
+    let _ = h.drain_count();
+
+    // Already in the Echo group: a second change does nothing (ChangePhantomTeam refuses it).
+    run(&mut h, &mut events, CHANGE);
+    assert!(drain_push_frames(&mut h).is_empty());
+
+    run(&mut h, &mut events, RESTORE);
+    let frames = drain_push_frames(&mut h);
+    let switches = of::<SwitchSceneGroupNotify>(&frames, SwitchSceneGroupNotify::MSG_ID);
+    assert_eq!(switches.len(), 1);
+    let (switch_pos, switch) = &switches[0];
+    assert_eq!((switch.PlayerId, switch.Group), (1, 1), "back to Battle = ETeamGroupType 1");
+    let removed = of::<EntityRemoveNotify>(&frames, EntityRemoveNotify::MSG_ID);
+    let (remove_pos, _) = removed
+        .iter()
+        .find(|(_, n)| n.RemoveInfos.iter().any(|r| r.EntityId == echo_eid))
+        .expect("EntityRemoveNotify for the Echo role");
+    assert!(switch_pos < remove_pos, "switch away before the Echo entity goes");
+    let scene = h.state.scene.as_ref().unwrap();
+    assert!(scene.phantom_role_entity_ids.is_empty());
+    assert!(scene.entity(echo_eid).is_none());
+    assert!(!h.state.player_components.role.role_map.contains_key(&ECHO_ROLE));
+
+    run(&mut h, &mut events, RESTORE);
+    assert!(drain_push_frames(&mut h).is_empty());
+}

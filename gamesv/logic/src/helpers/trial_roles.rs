@@ -7,11 +7,12 @@ use sonoro_gamesv_fs::formation_info::FormationRole;
 use sonoro_gamesv_fs::role_info::{Reson, RoleInfo, SkillNode};
 use sonoro_gamesv_fs::special_item_incr::TRIAL_INCR_MIN;
 use sonoro_gamesv_fs::weapon_item::WeaponItem;
-use sonoro_proto::enums::EAttributeType;
+use sonoro_proto::enums::{EAttributeType, ESceneRolesGroup, LivingStatus};
 use sonoro_proto::pb::{
     EntityAddNotify, EntityRemoveInfo, EntityRemoveNotify, FightRoleInfo, FightRoleInfos,
-    GroupFormation, PbGetRoleListNotify, UpdateGroupFormationNotify,
+    GroupFormation, PbGetRoleListNotify, SwitchSceneGroupNotify, UpdateGroupFormationNotify,
 };
+use sonoro_proto::wire::PbEnum;
 
 use crate::component::entity::small::{ConfigType, EntityType};
 use crate::component::player::{
@@ -19,7 +20,7 @@ use crate::component::player::{
     PlayerWeaponComponent,
 };
 use crate::event_queue::EventQueue;
-use crate::events::Event;
+use crate::events::{BuffAdditionEntry, Event};
 use crate::helpers::{entity_proto, role as role_helper, role_stats};
 use crate::scene::{Scene, now_millis};
 use crate::sink::PushSink;
@@ -803,4 +804,240 @@ pub fn sync_formation_entities<S: PushSink + ?Sized>(
         role_ids: target_role_ids.to_vec(),
     });
     Ok(())
+}
+
+/// Roles of a `PhantomFormation` row. Each is a TrialRoleInfo id whose parent RoleInfo has
+/// RoleType 2 (Id 1 = [5001001], parent 5001).
+pub fn phantom_formation_roles(assets: &Assets, formation_id: i32) -> Vec<i32> {
+    assets
+        .read_raw_json_array("PhantomFormation")
+        .iter()
+        .find(|row| row.get("Id").and_then(|v| v.as_i64()) == Some(i64::from(formation_id)))
+        .and_then(|row| row.get("Roles"))
+        .and_then(|v| v.as_array())
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(|v| v.as_i64().and_then(|id| i32::try_from(id).ok()))
+                .filter(|&id| id > 0)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn concomitant_ids(scene: &Scene, entity_id: i64) -> Vec<i64> {
+    scene
+        .entity(entity_id)
+        .and_then(|s| s.concomitant.as_ref())
+        .map(|c| c.vision_entity_id.iter().chain(&c.custom_entity_ids).copied().collect())
+        .unwrap_or_default()
+}
+
+fn remove_role_entities(
+    scene: &mut Scene,
+    fs: &FileSystem,
+    entity_ids: &[i64],
+) -> Vec<EntityRemoveInfo> {
+    let mut remove_infos = Vec::new();
+    for &eid in entity_ids {
+        for id in concomitant_ids(scene, eid).into_iter().chain([eid]) {
+            if scene.net_id_map.contains_key(&id) {
+                let _ = scene.remove(fs, id);
+                remove_infos.push(EntityRemoveInfo {
+                    EntityId: id,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    remove_infos
+}
+
+/// ChangePhantomFormation (server action). The client action only waits until its scene team
+/// is the Phantom group (LevelEventChangePhantomFormation: SceneTeamModel.IsPhantomTeam, set in
+/// SceneTeamModel.SwitchGroupInternal from UpdateSceneGroupDataNotify.CurrentGroup or
+/// SwitchSceneGroupNotify.Group). TeamGoBattle then waits for the group's role entities, so the
+/// formation's roles are spawned as role entities first, like trial roles. `AppendBuffIds` go
+/// on those roles. Does nothing while the Phantom group is in use, like the client's own
+/// SceneTeamController.ChangePhantomTeam.
+#[allow(clippy::too_many_arguments)]
+pub fn change_phantom_formation<S: PushSink + ?Sized>(
+    scene: &mut Scene,
+    fs: &FileSystem,
+    assets: &Assets,
+    sink: &mut S,
+    events: &mut EventQueue,
+    role_comp: &mut PlayerRoleComponent,
+    weapon_comp: &mut PlayerWeaponComponent,
+    echo_comp: &mut PlayerEchoComponent,
+    formation_id: i32,
+    append_buff_ids: &[i64],
+) -> Result<(), &'static str> {
+    if !scene.phantom_role_entity_ids.is_empty() {
+        return Ok(());
+    }
+    let role_ids: Vec<i32> = phantom_formation_roles(assets, formation_id)
+        .into_iter()
+        .filter(|&rid| materialize_trial_role(assets, role_comp, weapon_comp, echo_comp, rid))
+        .collect();
+    let Some(&cur_role) = role_ids.first() else {
+        return Ok(());
+    };
+    let instance_dungeon = assets
+        .tables
+        .instance_dungeon
+        .get_data_by_id(&scene.instance_id)
+        .or_else(|| assets.tables.instance_dungeon.get_data_by_id(&8))
+        .ok_or("InstanceDungeonNotFound")?;
+    push_trial_role_list(sink, assets, role_comp, weapon_comp, echo_comp, &role_ids)?;
+
+    let now_ms = now_millis();
+    let mut entity_ids = Vec::new();
+    let mut add_role_pbs = Vec::new();
+    let mut add_concom_pbs = Vec::new();
+    let mut fight_role_infos = Vec::new();
+    for &rid in &role_ids {
+        let mut spawn = || -> Result<_, &'static str> {
+            let entity = role_entity_templates::create_role_entity(
+                fs,
+                scene,
+                scene.player_id,
+                assets,
+                role_comp,
+                weapon_comp,
+                echo_comp,
+                &instance_dungeon,
+                rid,
+            )?;
+            entity_ids.push(entity.net_id);
+            if let Some(s) = scene.entity_mut(entity.net_id) {
+                s.visible = rid == cur_role;
+            }
+            add_role_pbs.push(entity_proto::build_optional(
+                assets,
+                scene,
+                None,
+                entity.net_id,
+                now_ms,
+            )?);
+            for cid in concomitant_ids(scene, entity.net_id) {
+                add_concom_pbs.push(entity_proto::build_optional(assets, scene, None, cid, now_ms)?);
+            }
+            Ok(entity)
+        };
+        let entity = match spawn() {
+            Ok(entity) => entity,
+            Err(err) => {
+                let _ = remove_role_entities(scene, fs, &entity_ids);
+                return Err(err);
+            }
+        };
+        fight_role_infos.push(FightRoleInfo {
+            RoleId: rid,
+            EntityId: entity.net_id,
+            OnStageWithoutControl: false,
+        });
+        let buffs: Vec<BuffAdditionEntry> = append_buff_ids
+            .iter()
+            .filter(|&&id| id > 0)
+            .map(|&id| BuffAdditionEntry {
+                id,
+                stack_count: 1,
+                is_active: true,
+                ..Default::default()
+            })
+            .collect();
+        if !buffs.is_empty() {
+            events.enqueue(Event::BuffAddition {
+                target: entity,
+                instigator: entity,
+                buffs,
+            });
+        }
+    }
+    scene.phantom_role_entity_ids = entity_ids;
+
+    sink.push(
+        EntityAddNotify::MSG_ID,
+        &EntityAddNotify {
+            EntityPbs: add_role_pbs,
+            RemoveTagIds: false,
+        },
+    );
+    if !add_concom_pbs.is_empty() {
+        sink.push(
+            EntityAddNotify::MSG_ID,
+            &EntityAddNotify {
+                EntityPbs: add_concom_pbs,
+                RemoveTagIds: false,
+            },
+        );
+    }
+    let phantom = ESceneRolesGroup::Phantom.to_i32();
+    sink.push(
+        UpdateGroupFormationNotify::MSG_ID,
+        &UpdateGroupFormationNotify {
+            GroupFormation: vec![GroupFormation {
+                PlayerId: scene.player_id,
+                FightRoleInfos: vec![FightRoleInfos {
+                    GroupType: phantom,
+                    FightRoleInfos: fight_role_infos,
+                    CurRole: cur_role,
+                    LivingStatus: Some(LivingStatus::Alive),
+                    IsFixedLocation: false,
+                }],
+                CurrentGroupType: phantom,
+            }],
+        },
+    );
+    sink.push(
+        SwitchSceneGroupNotify::MSG_ID,
+        &SwitchSceneGroupNotify {
+            PlayerId: scene.player_id,
+            Group: phantom,
+        },
+    );
+    Ok(())
+}
+
+/// RestorePhantomFormation (server action): back to the Battle group, then the Echo role
+/// entities and their trial role data go. The client's own SceneTeamController.RevertPhantomTeam
+/// also only switches to Battle, and only while the Phantom group is in use. Trial roles in
+/// `keep_trial_ids` (from AddTrialCharacter) keep their data.
+pub fn restore_phantom_formation<S: PushSink + ?Sized>(
+    scene: &mut Scene,
+    fs: &FileSystem,
+    sink: &mut S,
+    role_comp: &mut PlayerRoleComponent,
+    weapon_comp: &mut PlayerWeaponComponent,
+    echo_comp: &mut PlayerEchoComponent,
+    keep_trial_ids: &[i32],
+) {
+    let entity_ids = std::mem::take(&mut scene.phantom_role_entity_ids);
+    if entity_ids.is_empty() {
+        return;
+    }
+    sink.push(
+        SwitchSceneGroupNotify::MSG_ID,
+        &SwitchSceneGroupNotify {
+            PlayerId: scene.player_id,
+            Group: ESceneRolesGroup::Battle.to_i32(),
+        },
+    );
+    let role_ids: Vec<i32> = entity_ids
+        .iter()
+        .filter_map(|&eid| scene.entity(eid).map(|s| s.config.config_id))
+        .filter(|rid| role_comp.is_trial_role(*rid) && !keep_trial_ids.contains(rid))
+        .collect();
+    let remove_infos = remove_role_entities(scene, fs, &entity_ids);
+    if !remove_infos.is_empty() {
+        sink.push(
+            EntityRemoveNotify::MSG_ID,
+            &EntityRemoveNotify {
+                IsRemove: true,
+                RemoveInfos: remove_infos,
+            },
+        );
+    }
+    cleanup_removed_trial_roles(role_comp, weapon_comp, echo_comp, &role_ids);
 }

@@ -509,10 +509,14 @@ pub fn execute_action<S: PushSink + ?Sized>(
         }
         "ExecResurrection" => apply_exec_resurrection(ctx, params)?,
         "ChangePhantomFormation" => {
-            let fid = i64::from(json_int(params.get("FormationId")).unwrap_or(0));
-            record_progress_int(ctx, "phantom:formation_id", fid, false)?;
+            let fid = json_int(params.get("FormationId")).unwrap_or(0);
+            record_progress_int(ctx, "phantom:formation_id", i64::from(fid), false)?;
+            apply_change_phantom_formation(ctx, fid, params);
         }
-        "RestorePhantomFormation" => record_progress_int(ctx, "phantom:formation_id", 0, false)?,
+        "RestorePhantomFormation" => {
+            record_progress_int(ctx, "phantom:formation_id", 0, false)?;
+            apply_restore_phantom_formation(ctx);
+        }
         "SetReviveRegion" => {
             if let Some(rid) = json_int(params.get("ReviveId")) {
                 record_progress_int(ctx, "region:revive_id", i64::from(rid), false)?;
@@ -2967,6 +2971,51 @@ fn apply_remove_trial_character<S: PushSink + ?Sized>(
         ids.push(cid);
     }
     remove_trial_roles(ctx, &ids)
+}
+
+fn apply_change_phantom_formation<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    formation_id: i32,
+    params: &Map<String, Value>,
+) {
+    let (Some(scene), Some(role_comp)) = (ctx.scene.as_deref_mut(), ctx.role_comp.as_deref_mut())
+    else {
+        return;
+    };
+    let buff_ids: Vec<i64> = match params.get("AppendBuffIds") {
+        Some(Value::Array(ids)) => ids.iter().filter_map(|v| json_i64(Some(v))).collect(),
+        _ => Vec::new(),
+    };
+    if let Err(err) = trial_roles::change_phantom_formation(
+        scene,
+        ctx.fs,
+        ctx.assets,
+        ctx.sink,
+        ctx.events,
+        role_comp,
+        ctx.weapon_comp,
+        ctx.echo_comp,
+        formation_id,
+        &buff_ids,
+    ) {
+        tracing::warn!("ChangePhantomFormation {formation_id}: {err}");
+    }
+}
+
+fn apply_restore_phantom_formation<S: PushSink + ?Sized>(ctx: &mut QuestContext<'_, S>) {
+    let (Some(scene), Some(role_comp)) = (ctx.scene.as_deref_mut(), ctx.role_comp.as_deref_mut())
+    else {
+        return;
+    };
+    trial_roles::restore_phantom_formation(
+        scene,
+        ctx.fs,
+        ctx.sink,
+        role_comp,
+        ctx.weapon_comp,
+        ctx.echo_comp,
+        &ctx.quest_comp.info.env.trial_roles,
+    );
 }
 
 fn apply_area_time_state<S: PushSink + ?Sized>(
