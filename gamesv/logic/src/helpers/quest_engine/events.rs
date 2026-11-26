@@ -29,9 +29,10 @@ use super::triggers::{
     action_node_progress_key, build_pre_show_quest_list, consume_hand_in_items,
     count_node_actions, find_node_by_id, get_child_condition, handle_interact_option,
     is_battle_attr_or_wait_satisfied, is_kill_satisfied, is_level_play_satisfied,
-    is_schedule_time_window_match, mark_and_check_do_interact_complete, match_do_interact,
-    matches_check_ui_game_key, matches_hand_in_entity, matches_quest_interact_starter,
-    matches_reach_area, nested_dungeon_id, push_entity_level_events, push_node_progress_notify,
+    is_schedule_time_window_match, is_server_auto_interact, mark_and_check_do_interact_complete,
+    match_do_interact, matches_check_ui_game_key, matches_hand_in_entity,
+    matches_quest_interact_starter, matches_reach_area, nested_dungeon_id,
+    push_entity_level_events, push_node_progress_notify,
     push_ready_quest_list, reevaluate_condition_listeners, reevaluate_in_range_triggers,
     resolve_config_id, scene_entity_ctx, snapshot_active_quest_ids, start_flow_from_obj,
     start_flow_params, start_flow_params_bt,
@@ -167,7 +168,8 @@ fn merged_interact_component<S: PushSink + ?Sized>(
 
 /// Client side of a normal option: `TsInteractionUtils.HandleEntityInteractByServerNotify`
 /// takes `GetOptionByIndex(OptionIndex)` (InstanceId - 1, the index the client sent in
-/// EntityInteractRequest) and runs its `Actions`.
+/// EntityInteractRequest) and runs its `Actions`. An Auto option run by the server on a move
+/// is left out: the client's own request for it gets the notify.
 fn push_normal_interact_level_events<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     entity_id: i64,
@@ -175,6 +177,9 @@ fn push_normal_interact_level_events<S: PushSink + ?Sized>(
     option_index: i32,
     actions: &[sonoro_gamesv_data::tables::entity_components::interact::Action],
 ) {
+    if is_server_auto_interact() {
+        return;
+    }
     let Some(entity_ctx) = scene_entity_ctx(ctx, entity_id, cfg_id) else {
         return;
     };

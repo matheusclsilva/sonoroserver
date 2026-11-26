@@ -428,6 +428,13 @@ pub fn reevaluate_condition_listeners<S: PushSink + ?Sized>(
     Ok(())
 }
 
+/// True while `check_auto_interact_triggers` runs an Auto option for the player. The client
+/// interacts with Auto options itself and sends its own EntityInteractRequest
+/// (PawnInteractNewComponent.cs:1654-1660 -> InteractPawn -> HandleInteractionOptionNew).
+pub fn is_server_auto_interact() -> bool {
+    CHECKING_AUTO_INTERACTS.with(Cell::get)
+}
+
 pub fn check_auto_interact_triggers<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     pos: [f32; 3],

@@ -6626,6 +6626,36 @@ fn audit_132_interact_option_actions_push_normal_interact() {
     }
     let frames = drain_push_frames(&mut h);
     assert!(entity_action_notifies(&frames).is_empty());
+
+    // Gameplay085 146000634/146000635 (map 8): InteractComponent {DoIntactType Auto, Range 200,
+    // Options [0 [Collect, PostAkEvent]]}. The client sends its own EntityInteractRequest for an
+    // Auto option, so the server's run of it on a move sends nothing; the request does.
+    let mut h = TestHarness::new("audit132c", Some(8));
+    let mut events = EventQueue::new();
+    let _ = spawn_level_entity(&mut h, 146_000_634, EntityType::SceneItem);
+    let _ = h.drain_count();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::triggers::check_auto_interact_triggers(&mut qctx, [0.0; 3]).expect("auto");
+    }
+    assert!(
+        h.state.scene.as_ref().unwrap().auto_interact_states.values().any(|&v| v),
+        "the server ran the Auto option"
+    );
+    let frames = drain_push_frames(&mut h);
+    assert!(entity_action_notifies(&frames).is_empty());
+    let nid = spawn_level_entity(&mut h, 146_000_635, EntityType::SceneItem);
+    let _ = h.drain_count();
+    interact(&mut h, &mut events, nid, 0);
+    let frames = drain_push_frames(&mut h);
+    let auto: Vec<_> = entity_action_notifies(&frames)
+        .into_iter()
+        .map(|a| (a.1, a.2, a.3, a.4))
+        .collect();
+    assert_eq!(
+        auto,
+        vec![(GameCtxType::NormalInteract, (146_000_635, nid), 0, (1, 1, 2))]
+    );
 }
 
 #[test]
