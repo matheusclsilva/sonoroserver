@@ -26,7 +26,7 @@ use sonoro_proto::pb::{
     ChildQuestNodeEnterActionCtxPb, ChildQuestNodeFinishActionCtxPb, ChildQuestNodeInfo,
     ChildQuestNodeProgress, ChildQuestNodeProgressProgressOneof, CompleteInstProgress,
     CompositionConditionEnterActionCtxPb, CompositionEnterActionCtxPb, DailyQuestStateNotify,
-    DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify,
+    DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify, EntityCtxPb,
     EntityAddNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo, EntityRemoveNotify,
     EntityStateProgress, FailedNodeActionCtxPb, FightRoleInfo, FightRoleInfos, FlowStartNotify,
     FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
@@ -1892,6 +1892,65 @@ pub fn push_quest_level_events<S: PushSink + ?Sized>(
     Ok(())
 }
 
+/// Entity-owned lists leave `PlayFlow` to the server: interaction and trigger lists already
+/// start their flows with FlowStartNotify, and no StateChangeBehaviors entry plays a client flow.
+fn is_client_executable_entity_action<S: PushSink + ?Sized>(
+    ctx: &QuestContext<'_, S>,
+    act: &Value,
+) -> bool {
+    json_str(act.get("Name")) != Some("PlayFlow") && is_client_executable_bt_action(ctx, act)
+}
+
+/// `EntityCtx` of the scene entity `entity_id`, or of the one spawned from `cfg_id` when
+/// `entity_id` is not a net id. The client looks the entity up by `IncId` (its creature data
+/// id), so there is nothing to send for an entity it does not have.
+pub fn scene_entity_ctx<S: PushSink + ?Sized>(
+    ctx: &QuestContext<'_, S>,
+    entity_id: i64,
+    cfg_id: i32,
+) -> Option<EntityCtxPb> {
+    let scene = ctx.scene.as_deref()?;
+    let net_id = if scene.entity(entity_id).is_some() {
+        entity_id
+    } else if cfg_id > 0 {
+        scene.find_entity_net_id_by_config_id(cfg_id)?
+    } else {
+        return None;
+    };
+    Some(EntityCtxPb {
+        ConfigId: cfg_id,
+        IncId: net_id,
+    })
+}
+
+/// Client side of an entity-owned action list. `LevelGeneralNetworks.OnActionNotify` finds the
+/// entity by `EntityCtx.IncId` and takes the list from the entity's own config by `ctx_type`.
+/// One session id per list, so the client queues the runs of the list in order.
+pub fn push_entity_level_events<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    ctx_type: GameCtxType,
+    ctx_info: GameCtxPbCtxInfoOneof,
+    actions: &[Value],
+) {
+    if !actions.iter().any(|act| is_client_executable_entity_action(ctx, act)) {
+        return;
+    }
+    let Some(inc_id) = ctx.scene.as_deref_mut().map(Scene::alloc_action_inc_id) else {
+        return;
+    };
+    let game_ctx = GameCtxPb {
+        CtxType: Some(ctx_type),
+        CtxInfo: Some(ctx_info),
+    };
+    push_level_event_ranges_with(
+        ctx,
+        inc_id,
+        &game_ctx,
+        actions,
+        is_client_executable_entity_action,
+    );
+}
+
 /// Sends one `ActionNotify` per run of client-executable actions in `actions`; the client
 /// looks the list up again from its own config by `game_ctx` and runs `StartIndex..=EndIndex`.
 fn push_level_event_ranges<S: PushSink + ?Sized>(
@@ -1900,16 +1959,26 @@ fn push_level_event_ranges<S: PushSink + ?Sized>(
     game_ctx: &GameCtxPb,
     actions: &[Value],
 ) {
+    push_level_event_ranges_with(ctx, inc_id, game_ctx, actions, is_client_executable_bt_action);
+}
+
+fn push_level_event_ranges_with<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    inc_id: i32,
+    game_ctx: &GameCtxPb,
+    actions: &[Value],
+    is_forwarded: fn(&QuestContext<'_, S>, &Value) -> bool,
+) {
     let total_count = actions.len() as i32;
     let player_id = ctx.basic_comp.player_id;
     let mut i = 0usize;
     while i < actions.len() {
-        if !is_client_executable_bt_action(ctx, &actions[i]) {
+        if !is_forwarded(ctx, &actions[i]) {
             i += 1;
             continue;
         }
         let start_idx = i;
-        while i < actions.len() && is_client_executable_bt_action(ctx, &actions[i]) {
+        while i < actions.len() && is_forwarded(ctx, &actions[i]) {
             i += 1;
         }
         let end_idx = i - 1;

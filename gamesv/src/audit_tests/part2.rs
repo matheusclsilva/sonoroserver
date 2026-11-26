@@ -6493,3 +6493,137 @@ fn audit_131_level_play_challenge_hud_nodes_activate_and_timers_reach_client() {
     let bt_timers = &h.state.scene.as_ref().unwrap().bt_timers;
     assert!(!bt_timers.iter().any(|t| t.owner_id == LP), "{bt_timers:?}");
 }
+
+/// `ActionNotify` frames with an entity context, as (frame index, ctx type, (ConfigId, IncId)
+/// of the entity, ctx index, (StartIndex, EndIndex, TotalCount), notify IncId). The ctx index
+/// is OptionIndex, StateIndex, TriggerEntityIncId or EntityConditionListeningIndex.
+fn entity_action_notifies(
+    frames: &[(u16, Vec<u8>)],
+) -> Vec<(usize, GameCtxType, (i32, i64), i64, (i32, i32, i32), i32)> {
+    use sonoro_proto::pb::{GameCtxPbCtxInfoOneof as Info, LevelEventNotify};
+    let mut out = Vec::new();
+    for (i, (id, payload)) in frames.iter().enumerate() {
+        if *id != LevelEventNotify::MSG_ID {
+            continue;
+        }
+        let n = <LevelEventNotify as sonoro_proto::wire::PbMessage>::decode(payload).unwrap();
+        let gctx = n.GameCtx.expect("GameCtx");
+        let (entity, index) = match gctx.CtxInfo.expect("CtxInfo") {
+            Info::NormalInteract(c) => (c.EntityCtx, i64::from(c.OptionIndex)),
+            Info::StateChangeAction(c) => (c.EntityCtx, i64::from(c.StateIndex)),
+            Info::EntityTrigger(c) => (c.EntityCtx, c.TriggerEntityIncId),
+            Info::EntityLeaveTriggerCtx(c) => (c.EntityCtx, c.TriggerEntityIncId),
+            Info::EntityConditionListeningAction(c) => {
+                (c.EntityCtx, i64::from(c.EntityConditionListeningIndex))
+            }
+            _ => continue,
+        };
+        let entity = entity.expect("EntityCtx");
+        out.push((
+            i,
+            gctx.CtxType.expect("CtxType"),
+            (entity.ConfigId, entity.IncId),
+            index,
+            (n.StartIndex, n.EndIndex, n.TotalCount),
+            n.IncId,
+        ));
+    }
+    out
+}
+
+fn spawn_level_entity(h: &mut TestHarness, cfg_id: i32, entity_type: EntityType) -> i64 {
+    let mut s = EntityComponentStorage::new(
+        0,
+        ConfigComponent {
+            camp: 0,
+            config_id: cfg_id,
+            config_type: ConfigType::Level,
+            entity_type,
+            state: EntityState::Default,
+        },
+    );
+    s.position = Some(PositionComponent {
+        location: [0.0; 3],
+        rotation: [0.0; 3],
+    });
+    h.state.scene.as_mut().unwrap().spawn(s).net_id
+}
+
+#[test]
+fn audit_132_interact_option_actions_push_normal_interact() {
+    use sonoro_proto::pb::EntityInteractRequest;
+
+    // NPC0004 109002500 (map 8) InteractComponent.Options: 0 [OpenSystemBoard Shop 104];
+    // 1 {Condition CompareEntityState 109700058 常态} [PlayFlow 剧情_天城生态_NPC 41/6,
+    // UnlockSystemItem, ChangeEntityState 109700058 激活]; 2 Flow.
+    const NPC: i32 = 109_002_500;
+    fn interact(h: &mut TestHarness, events: &mut EventQueue, nid: i64, option: i32) {
+        let resp = scene::handle_entity_interact_request(
+            &mut h.state,
+            events,
+            EntityInteractRequest {
+                EntityId: nid,
+                OptionIndex: option,
+                ..Default::default()
+            },
+        )
+        .expect("interact");
+        assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    }
+
+    let mut h = TestHarness::new("audit132", Some(8));
+    let mut events = EventQueue::new();
+    let nid = spawn_level_entity(&mut h, NPC, EntityType::Npc);
+    let _ = h.drain_count();
+
+    // The shop option is client-only: the whole list goes to the client.
+    interact(&mut h, &mut events, nid, 0);
+    let frames = drain_push_frames(&mut h);
+    let shop = entity_action_notifies(&frames);
+    assert_eq!(shop.len(), 1, "{shop:?}");
+    assert_eq!(
+        (shop[0].1, shop[0].2, shop[0].3, shop[0].4),
+        (GameCtxType::NormalInteract, (NPC, nid), 0, (0, 0, 1))
+    );
+    assert!(shop[0].5 > 0);
+
+    // Option 1: the server starts the flow and unlocks the cook book; the client gets only the
+    // ChangeEntityState, before the server runs the list.
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(109_700_058, "关卡.Common.状态.常态");
+    interact(&mut h, &mut events, nid, 1);
+    let frames = drain_push_frames(&mut h);
+    let acts = entity_action_notifies(&frames);
+    assert_eq!(acts.len(), 1, "{acts:?}");
+    assert_eq!(
+        (acts[0].1, acts[0].2, acts[0].3, acts[0].4),
+        (GameCtxType::NormalInteract, (NPC, nid), 1, (2, 2, 3))
+    );
+    assert_ne!(acts[0].5, shop[0].5, "one session id per list");
+    let flow = frames
+        .iter()
+        .position(|f| f.0 == FlowStartNotify::MSG_ID)
+        .expect("FlowStartNotify for the option's PlayFlow");
+    assert!(acts[0].0 < flow);
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(109_700_058),
+        Some("关卡.Common.状态.激活")
+    );
+
+    // The server still runs the option of an entity that is not in the scene (by config id),
+    // but the client has no entity to run it on.
+    let mut h = TestHarness::new("audit132b", Some(8));
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(
+            quest_engine::events::on_interact_handled(&mut qctx, i64::from(NPC), 0)
+                .expect("interact")
+        );
+    }
+    let frames = drain_push_frames(&mut h);
+    assert!(entity_action_notifies(&frames).is_empty());
+}

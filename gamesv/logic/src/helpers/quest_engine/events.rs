@@ -5,9 +5,12 @@ use std::io;
 use serde_json::{Map, Value};
 use sonoro_gamesv_data::asset_indexes::MapEntityKey;
 use sonoro_gamesv_fs::quest_info::append_unique_int;
-use sonoro_proto::enums::{BtType, ChildQuestNodeStatus, ErrorCode, FailReason, TimerSetType};
+use sonoro_proto::enums::{
+    BtType, ChildQuestNodeStatus, ErrorCode, FailReason, GameCtxType, TimerSetType,
+};
 use sonoro_proto::pb::{
-    BtRollbackStartNotify, FlowEndNotify, FlowOptionInfoList, LordGymLevelPlayResultNotify,
+    BtRollbackStartNotify, FlowEndNotify, FlowOptionInfoList, GameCtxPbCtxInfoOneof,
+    LordGymLevelPlayResultNotify, NormalInteractCtxPb,
     QuestGiveUpNotify, TowerEndNotify, TowerFloorPb, TowerFloorUpdateNotify,
     TowerRolePb, UpdateChildQuestNodeStatusNotify, UpdateTimerInfoNotify,
 };
@@ -28,9 +31,10 @@ use super::triggers::{
     is_battle_attr_or_wait_satisfied, is_kill_satisfied, is_level_play_satisfied,
     is_schedule_time_window_match, mark_and_check_do_interact_complete, match_do_interact,
     matches_check_ui_game_key, matches_hand_in_entity, matches_quest_interact_starter,
-    matches_reach_area, nested_dungeon_id, push_node_progress_notify, push_ready_quest_list,
-    reevaluate_condition_listeners, reevaluate_in_range_triggers, resolve_config_id,
-    snapshot_active_quest_ids, start_flow_from_obj, start_flow_params, start_flow_params_bt,
+    matches_reach_area, nested_dungeon_id, push_entity_level_events, push_node_progress_notify,
+    push_ready_quest_list, reevaluate_condition_listeners, reevaluate_in_range_triggers,
+    resolve_config_id, scene_entity_ctx, snapshot_active_quest_ids, start_flow_from_obj,
+    start_flow_params, start_flow_params_bt,
 };
 use super::{
     PROLOGUE_QUEST_ID, interrupt_active_flow_for_quest,
@@ -159,6 +163,34 @@ fn merged_interact_component<S: PushSink + ?Sized>(
         tpl.ComponentsData.merge_into(&mut components);
     }
     components.InteractComponent
+}
+
+/// Client side of a normal option: `TsInteractionUtils.HandleEntityInteractByServerNotify`
+/// takes `GetOptionByIndex(OptionIndex)` (InstanceId - 1, the index the client sent in
+/// EntityInteractRequest) and runs its `Actions`.
+fn push_normal_interact_level_events<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    entity_id: i64,
+    cfg_id: i32,
+    option_index: i32,
+    actions: &[sonoro_gamesv_data::tables::entity_components::interact::Action],
+) {
+    let Some(entity_ctx) = scene_entity_ctx(ctx, entity_id, cfg_id) else {
+        return;
+    };
+    let raw: Vec<Value> = actions
+        .iter()
+        .map(|act| act.Raw.clone().unwrap_or_default())
+        .collect();
+    push_entity_level_events(
+        ctx,
+        GameCtxType::NormalInteract,
+        GameCtxPbCtxInfoOneof::NormalInteract(NormalInteractCtxPb {
+            EntityCtx: Some(entity_ctx),
+            OptionIndex: option_index,
+        }),
+        &raw,
+    );
 }
 
 fn execute_normal_interact_actions<S: PushSink + ?Sized>(
@@ -486,6 +518,7 @@ pub fn on_interact_handled<S: PushSink + ?Sized>(
                     }
                 }
             } else if ot.Type == "Actions" {
+                push_normal_interact_level_events(ctx, entity_id, cfg_id, option_index, &ot.Actions);
                 execute_normal_interact_actions(
                     ctx,
                     entity_id,
