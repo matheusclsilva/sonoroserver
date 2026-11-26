@@ -25,7 +25,8 @@ use sonoro_proto::pb::{
     ActionGroupNodeActionCtxPb, BehaviorTreeCtxPb, BehaviorTreeInfoNotify,
     ChildQuestNodeEnterActionCtxPb, ChildQuestNodeFinishActionCtxPb, ChildQuestNodeInfo,
     ChildQuestNodeProgress, ChildQuestNodeProgressProgressOneof, CompleteInstProgress,
-    DailyQuestStateNotify, DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify,
+    CompositionConditionEnterActionCtxPb, CompositionEnterActionCtxPb, DailyQuestStateNotify,
+    DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify,
     EntityAddNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo, EntityRemoveNotify,
     EntityStateProgress, FailedNodeActionCtxPb, FightRoleInfo, FightRoleInfos, FlowStartNotify,
     FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
@@ -1792,12 +1793,83 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
                 BehaviorTreeCtx: Some(bt_ctx),
             })
         }
+        GameCtxType::CompositionEnterAction => {
+            GameCtxPbCtxInfoOneof::CompositionEnterAction(CompositionEnterActionCtxPb {
+                BehaviorTreeCtx: Some(bt_ctx),
+            })
+        }
         _ => return Ok(()),
     };
     let game_ctx = GameCtxPb {
         CtxType: Some(ctx_type),
         CtxInfo: Some(ctx_info),
     };
+    push_level_event_ranges(ctx, owner_id, &game_ctx, actions);
+    Ok(())
+}
+
+/// Client side of a composite node's `SaveConfig` when the node is entered. The client
+/// runs `InitConditionActions[ConditionIndex].Action` for CompositionConditionEnterAction and
+/// `EnterActions` for CompositionEnterAction (BaseBehaviorTree.DoAction). It does not check
+/// the entry's `Condition`, so only the entries whose condition holds are sent.
+pub fn push_bt_composition_enter_events<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    bt_type: BtType,
+    owner_id: i32,
+    node: &NodeEntry,
+) -> io::Result<()> {
+    let Some(Value::Object(save_val)) = node.data.get("SaveConfig") else {
+        return Ok(());
+    };
+    if let Some(Value::Array(init_acts)) = save_val.get("InitConditionActions") {
+        for (idx, entry) in init_acts.iter().enumerate() {
+            let Some(Value::Array(acts)) = entry.get("Action") else {
+                continue;
+            };
+            if entry
+                .get("Condition")
+                .is_some_and(|cb| !eval_inline_condition(ctx, owner_id, cb))
+            {
+                continue;
+            }
+            let game_ctx = GameCtxPb {
+                CtxType: Some(GameCtxType::CompositionConditionEnterAction),
+                CtxInfo: Some(GameCtxPbCtxInfoOneof::CompositionConditionEnterAction(
+                    CompositionConditionEnterActionCtxPb {
+                        BehaviorTreeCtx: Some(BehaviorTreeCtxPb {
+                            IncId: i64::from(owner_id),
+                            BtType: Some(bt_type),
+                            BtId: owner_id,
+                            NodeId: node.id,
+                        }),
+                        ConditionIndex: idx as i32,
+                    },
+                )),
+            };
+            push_level_event_ranges(ctx, owner_id, &game_ctx, acts);
+        }
+    }
+    if let Some(Value::Array(enter_acts)) = save_val.get("EnterActions") {
+        push_bt_level_events_for_type(
+            ctx,
+            bt_type,
+            owner_id,
+            node.id,
+            GameCtxType::CompositionEnterAction,
+            enter_acts,
+        )?;
+    }
+    Ok(())
+}
+
+/// Sends one `ActionNotify` per run of client-executable actions in `actions`; the client
+/// looks the list up again from its own config by `game_ctx` and runs `StartIndex..=EndIndex`.
+fn push_level_event_ranges<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    inc_id: i32,
+    game_ctx: &GameCtxPb,
+    actions: &[Value],
+) {
     let total_count = actions.len() as i32;
     let player_id = ctx.basic_comp.player_id;
     let mut i = 0usize;
@@ -1815,7 +1887,7 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
             LevelEventNotify::MSG_ID,
             &LevelEventNotify {
                 PlayerId: player_id,
-                IncId: owner_id,
+                IncId: inc_id,
                 GameCtx: Some(game_ctx.clone()),
                 TotalCount: total_count,
                 StartIndex: start_idx as i32,
@@ -1824,7 +1896,6 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
             },
         );
     }
-    Ok(())
 }
 
 pub fn push_bt_level_events<S: PushSink + ?Sized>(

@@ -35,8 +35,9 @@ use super::triggers::{
     action_node_progress_key, build_pre_show_quest_list, build_tree_info, entity_hp_percent,
     eval_compare_var_list, execute_actions, extract_node_action_items, find_node_by_id,
     find_root_node, get_child_condition, init_tree_info, is_sync_play_flow_action,
-    push_ancestor_activations, push_bt_level_events, push_daily_and_branch_notifies,
-    push_do_interact_options_for_node, push_node_status, push_ready_quest_list,
+    push_ancestor_activations, push_bt_composition_enter_events, push_bt_level_events,
+    push_daily_and_branch_notifies, push_do_interact_options_for_node, push_node_status,
+    push_ready_quest_list,
     remove_do_interact_options_for_node, should_auto_complete_child_quest,
     snapshot_active_quest_ids, start_flow_from_obj, sync_scene_current_node,
     ensure_tracked_focus_valid,
@@ -1435,6 +1436,9 @@ fn check_node_occupation_and_save<S: PushSink + ?Sized>(
             .as_deref_mut()
             .is_some_and(|scene| scene.mark_save_node_entered(quest_id, node.id));
         if newly_entered {
+            if push_updates {
+                push_bt_composition_enter_events(ctx, bt_type, quest_id, node)?;
+            }
             if let Some(Value::Array(init_acts)) = save_val.get("InitConditionActions")
                 && !init_acts.is_empty()
             {

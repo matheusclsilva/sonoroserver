@@ -5767,6 +5767,8 @@ fn bt_action_notifies(
             Info::ActionGroupNodeAction(c) => c.BehaviorTreeCtx,
             Info::ChildQuestNodeEnterAction(c) => c.BehaviorTreeCtx,
             Info::ChildQuestNodeFinishAction(c) => c.BehaviorTreeCtx,
+            Info::CompositionEnterAction(c) => c.BehaviorTreeCtx,
+            Info::CompositionConditionEnterAction(c) => c.BehaviorTreeCtx,
             _ => None,
         }
         .unwrap_or_default();
@@ -5882,4 +5884,132 @@ fn audit_126_quest_failed_finish_actions_push_failed_node_action() {
     let rollback = frames.iter().position(|f| f.0 == BtRollbackNotify::MSG_ID).unwrap();
     let rebuild = frames.iter().position(|f| f.0 == BtRollbackInfoNotify::MSG_ID).unwrap();
     assert!(rollback < pos && pos < rebuild, "order {rollback} < {pos} < {rebuild}");
+}
+
+#[test]
+fn audit_127_save_config_enter_actions_push_composition_contexts() {
+    use sonoro_proto::enums::FailReason;
+    use sonoro_proto::pb::{GameCtxPbCtxInfoOneof as Info, LevelEventNotify};
+
+    fn condition_indexes(frames: &[(u16, Vec<u8>)]) -> Vec<i32> {
+        frames
+            .iter()
+            .filter(|f| f.0 == LevelEventNotify::MSG_ID)
+            .filter_map(|f| {
+                let n = <LevelEventNotify as sonoro_proto::wire::PbMessage>::decode(&f.1).ok()?;
+                match n.GameCtx?.CtxInfo? {
+                    Info::CompositionConditionEnterAction(c) => Some(c.ConditionIndex),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+    fn of_type(
+        frames: &[(u16, Vec<u8>)],
+        t: GameCtxType,
+    ) -> Vec<(usize, Option<BtType>, i32, i32, i32, i32, i32)> {
+        bt_action_notifies(frames)
+            .into_iter()
+            .filter(|a| a.1 == t)
+            .map(|(i, _, bt, id, nid, s, e, total)| (i, bt, id, nid, s, e, total))
+            .collect()
+    }
+
+    // (i) Quest 686000001: 1 Sequence > 4 ParallelSelect SaveConfig.EnterActions [FadeOutScreen,
+    // RemoveTrialCharacter, ShowHidedGroup, PostAkEvent, PostAkEvent]. The two middle actions
+    // are server-only, so the client gets 0..0 and 3..4.
+    const LANTERN_QID: i32 = 686_000_001;
+    let mut h = TestHarness::new("audit127a", Some(8));
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(quest_engine::tree::activate_quest(&mut qctx, LANTERN_QID, true).expect("activate"));
+    }
+    let frames = drain_push_frames(&mut h);
+    let enter: Vec<_> = of_type(&frames, GameCtxType::CompositionEnterAction)
+        .into_iter()
+        .map(|a| (a.1, a.2, a.3, a.4, a.5, a.6))
+        .collect();
+    let q = Some(BtType::BtTypeQuest);
+    assert_eq!(enter, vec![(q, LANTERN_QID, 4, 0, 0, 5), (q, LANTERN_QID, 4, 3, 4, 5)]);
+    // Entering again in the same scene does not resend them.
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::advance_quest_tree(&mut qctx, LANTERN_QID, true).expect("advance");
+    }
+    let frames = drain_push_frames(&mut h);
+    assert!(of_type(&frames, GameCtxType::CompositionEnterAction).is_empty());
+
+    // (ii) Quest 42850002: 1 Sequence > [2, 4 ParallelSelect SaveConfig {} > [5, 6 QuestFailed],
+    // 7 ParallelSelect SaveConfig.InitConditionActions [{Condition SaveConfigEnterMethod
+    // Ne FirstTime, Action [FadeOutScreen]}] > [.., 9 QuestFailed]]. First entry of 7: not sent.
+    // rollback_quest_to_node picks the latest finished/active SaveConfig node, which is 4 (a
+    // composite such as 7 is never in active_nodes), so 7 is entered again only after 5 is
+    // done again; SaveConfigEnterMethod then reads FailureRollBack and the FadeOutScreen is sent.
+    const QID: i32 = 42_850_002;
+    let mut h = TestHarness::new("audit127b", Some(8));
+    let mut events = EventQueue::new();
+    let nodes = h.state.assets.quest_nodes.get_owner_nodes(QID).expect("quest nodes");
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(quest_engine::tree::activate_quest(&mut qctx, QID, true).expect("activate"));
+    }
+    for nid in [2, 5] {
+        let node = nodes.iter().find(|n| n.id == nid).unwrap().clone();
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::complete_child_quest(&mut qctx, QID, &nodes, &node).expect("complete");
+    }
+    assert!(h.state.scene.as_ref().unwrap().has_save_node_entered(QID, 7));
+    let frames = drain_push_frames(&mut h);
+    assert!(
+        of_type(&frames, GameCtxType::CompositionConditionEnterAction).is_empty(),
+        "Ne FirstTime must not run on the first entry"
+    );
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::rollback_quest_to_node(&mut qctx, QID, 9, FailReason::TransferFail, false)
+            .expect("rollback");
+    }
+    let frames = drain_push_frames(&mut h);
+    assert_eq!(of_type(&frames, GameCtxType::FailedNodeAction).len(), 1);
+    assert!(of_type(&frames, GameCtxType::CompositionConditionEnterAction).is_empty());
+    assert!(!h.state.scene.as_ref().unwrap().has_save_node_entered(QID, 7));
+    {
+        let node = nodes.iter().find(|n| n.id == 5).unwrap().clone();
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::complete_child_quest(&mut qctx, QID, &nodes, &node).expect("redo 5");
+    }
+    let frames = drain_push_frames(&mut h);
+    let init = of_type(&frames, GameCtxType::CompositionConditionEnterAction);
+    assert_eq!(init.len(), 1, "{init:?}");
+    assert_eq!(
+        (init[0].1, init[0].2, init[0].3, init[0].4, init[0].5, init[0].6),
+        (Some(BtType::BtTypeQuest), QID, 7, 0, 0, 1)
+    );
+    assert_eq!(condition_indexes(&frames), vec![0]);
+
+    // (iii) LevelPlay 32850014 (map 8): root 1 Sequence SaveConfig.EnterActions [PostAkEvent,
+    // ChangeEntityState]. The first boot steps the tree before BehaviorTreeInfoNotify, so the
+    // actions are sent after it.
+    const LP: i32 = 32_850_014;
+    let mut h = TestHarness::new("audit127c", Some(8));
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::on_level_play_enabled(&mut lctx, LP, true).expect("enable lp");
+    }
+    assert!(h.state.player_components.quest.info.progress.entered_level_plays.contains(&LP));
+    let frames = drain_push_frames(&mut h);
+    let enter = of_type(&frames, GameCtxType::CompositionEnterAction);
+    assert_eq!(enter.len(), 1, "{enter:?}");
+    assert_eq!(
+        (enter[0].1, enter[0].2, enter[0].3, enter[0].4, enter[0].5, enter[0].6),
+        (Some(BtType::BtTypeLevelPlay), LP, 1, 0, 1, 2)
+    );
+    let tree_info = frames
+        .iter()
+        .position(|f| f.0 == BehaviorTreeInfoNotify::MSG_ID)
+        .expect("BehaviorTreeInfoNotify");
+    assert!(tree_info < enter[0].0);
 }

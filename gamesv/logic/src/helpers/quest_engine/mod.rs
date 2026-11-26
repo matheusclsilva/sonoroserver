@@ -37,8 +37,9 @@ pub use triggers::{
     eval_child_condition_auto, eval_inline_condition, get_child_condition_pub,
     has_async_play_flow_action, is_client_action_name_registered, is_safe_bt_leisure_interact,
     matches_reach_area_pub, node_action_items_pub, push_bt_child_node_status,
-    push_bt_level_events_for_type, push_do_interact_options_for_bt_node,
-    push_do_interact_options_for_bt_node_mode, register_dynamic_interact_options_for_entity,
+    push_bt_composition_enter_events, push_bt_level_events_for_type,
+    push_do_interact_options_for_bt_node, push_do_interact_options_for_bt_node_mode,
+    register_dynamic_interact_options_for_entity,
     remove_do_interact_options_for_bt_node, sync_dynamic_interact_options_for_entity,
 };
 

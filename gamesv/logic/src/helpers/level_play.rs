@@ -1848,6 +1848,20 @@ fn enter_and_start_level_play<S: PushSink + ?Sized>(
             );
         }
 
+        // The boot step above ran with push_updates off (the client had no tree yet), so the
+        // SaveConfig actions of the composite nodes it entered are sent now.
+        for snode in nodes.iter() {
+            if ctx.scene.has_save_node_entered(lp_id, snode.id) {
+                let mut qctx = ctx.as_quest_ctx();
+                let _ = quest_engine::push_bt_composition_enter_events(
+                    &mut qctx,
+                    BtType::BtTypeLevelPlay,
+                    lp_id,
+                    snode,
+                );
+            }
+        }
+
         for cnode in &newly_activated {
             let mut qctx = ctx.as_quest_ctx();
             let enter_acts = quest_engine::node_action_items_pub(Some(cnode), "EnterActions");
