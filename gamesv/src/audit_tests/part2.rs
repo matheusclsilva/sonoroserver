@@ -5323,9 +5323,7 @@ fn audit_122_level_play_quest_failed_monitor_only_while_branch_active() {
     const ECHO_ANCHOR: [f32; 3] = [56_877.02, 258_948.63, 1_101.0];
     // LevelPlay 124000079: 1 Sequence > 13 Sequence > [12 CheckEntityState 124003592 激活,
     // 24 Timer 3 s, 4 ParallelSelect > 6 Sequence > 11 QuestFailed {Timer 120 CountDownChallenge}].
-    // LevelPlay 122000234 shares anchor 32000031 and has QuestFailed 11 {Timer 30} behind node 2.
     const PARKOUR_LP: i32 = 124_000_079;
-    const SAMPLE_LP: i32 = 122_000_234;
     const PARKOUR_FAIL_NODE: i32 = 11;
     const PARKOUR_ANCHOR: [f32; 3] = [-37_329.65, 114_375.45, 4_519.92];
 
@@ -5387,14 +5385,12 @@ fn audit_122_level_play_quest_failed_monitor_only_while_branch_active() {
     let mut h = TestHarness::new("audit122b", Some(8));
     let mut events = EventQueue::new();
     move_to(&mut h, &mut events, PARKOUR_ANCHOR);
-    for lp_id in [PARKOUR_LP, SAMPLE_LP] {
-        assert!(entered(&h, lp_id), "LevelPlay {lp_id} must enter at anchor 32000031");
-        assert_eq!(
-            fail_timer_due(&h, lp_id),
-            None,
-            "LevelPlay {lp_id} QuestFailed 11 must not count down before the challenge starts"
-        );
-    }
+    assert!(entered(&h, PARKOUR_LP), "LevelPlay {PARKOUR_LP} must enter at anchor 32000031");
+    assert_eq!(
+        fail_timer_due(&h, PARKOUR_LP),
+        None,
+        "QuestFailed 11 must not count down before the challenge starts"
+    );
 
     // A fail timer left over from an inactive branch must not fire.
     h.state.scene.as_mut().unwrap().lp_fail_timers.upsert(QuestTimerEntry {
@@ -5439,4 +5435,64 @@ fn audit_122_level_play_quest_failed_monitor_only_while_branch_active() {
     move_to(&mut h, &mut events, PARKOUR_ANCHOR);
     assert_eq!(fail_timer_due(&h, PARKOUR_LP), Some(due));
     assert!(entered(&h, PARKOUR_LP));
+}
+
+#[test]
+fn audit_123_level_play_only_opens_on_its_level_id_map() {
+    use sonoro_proto::pb::EnterLevelPlayNotify;
+
+    // LevelPlay 122000234 玩法样例-声骸挑战-遁地鼠-吃点 is a sample of test level 100
+    // (LevelId 100, InstanceId 8, Children e_100_122000065 / e_100_122000066). Its anchor id
+    // 32000031 also exists in Jinzhou, where it anchors LevelPlay 124000079 全息跑酷_线路2
+    // (LevelId 8). The client binds a play to its LevelId (LevelPlayInfo.MapId), so only
+    // 124000079 may open in map 8.
+    const PARKOUR_LP: i32 = 124_000_079;
+    const SAMPLE_LP: i32 = 122_000_234;
+    const ANCHOR_POS: [f32; 3] = [-37_329.65, 114_375.45, 4_519.92];
+
+    let mut h = TestHarness::new("audit123", Some(8));
+    {
+        let assets = &h.state.assets;
+        let sample = assets
+            .tables
+            .level_play_data
+            .get_data_by_id(&SAMPLE_LP)
+            .expect("LevelPlay 122000234");
+        let d = &sample.Data;
+        assert_eq!(
+            (d.LevelId, d.InstanceId, d.LevelPlayEntityId),
+            (100, 8, 32_000_031)
+        );
+        assert!(assets.find_level_entity(8, 32_000_031).is_some());
+        assert!(assets.find_level_entity(8, 122_000_065).is_none());
+        assert!(assets.find_level_entity(100, 122_000_065).is_some());
+    }
+    let _ = h.drain_count();
+
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::on_player_move(&mut lctx, ANCHOR_POS[0], ANCHOR_POS[1], ANCHOR_POS[2])
+            .expect("lp move");
+    }
+    let progress = &h.state.player_components.quest.info.progress;
+    assert!(
+        progress.entered_level_plays.contains(&PARKOUR_LP),
+        "Jinzhou LevelPlay {PARKOUR_LP} must enter at 32000031"
+    );
+    assert!(
+        !progress.entered_level_plays.contains(&SAMPLE_LP),
+        "level-100 LevelPlay {SAMPLE_LP} must not enter in map 8"
+    );
+    let enter_ids: Vec<i32> = h
+        .drain_decoded::<EnterLevelPlayNotify>(EnterLevelPlayNotify::MSG_ID)
+        .iter()
+        .map(|n| n.Id)
+        .collect();
+    assert!(enter_ids.contains(&PARKOUR_LP));
+    assert!(
+        !enter_ids.contains(&SAMPLE_LP),
+        "no EnterLevelPlayNotify for {SAMPLE_LP}"
+    );
 }

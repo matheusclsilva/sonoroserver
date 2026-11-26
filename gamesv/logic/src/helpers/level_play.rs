@@ -207,6 +207,16 @@ pub fn resolve_entity_config(
 }
 
 fn matches_scene_instance(assets: &Assets, lp: &LevelPlayData, scene_instance_id: i32) -> bool {
+    // A play lives on its LevelId map (client LevelPlayInfo.MapId = LevelId, entities
+    // `e_<LevelId>_<id>`); InstanceId only narrows the instance. Same rule as
+    // `evaluate_entered_level_play_trees` for non-dungeon plays.
+    if lp.Data.Type != "Dungeon"
+        && lp.Data.LevelId != 0
+        && lp.Data.LevelId != scene_instance_id
+        && assets.resolve_map_config_id(scene_instance_id) != lp.Data.LevelId
+    {
+        return false;
+    }
     let expected_inst = if lp.Data.InstanceId != 0 {
         lp.Data.InstanceId
     } else {
@@ -4373,7 +4383,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        assert!(matches_scene_instance(&assets, &lahai_roi_lp, 906));
+        // InstanceId narrows the LevelId map's instance but never moves the play off it.
+        assert!(!matches_scene_instance(&assets, &lahai_roi_lp, 906));
         assert!(!matches_scene_instance(&assets, &lahai_roi_lp, 8));
     }
 
