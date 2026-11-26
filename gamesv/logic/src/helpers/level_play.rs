@@ -387,6 +387,42 @@ fn find_lp_root_node(nodes: &[NodeEntry]) -> Option<&NodeEntry> {
     nodes.iter().find(|n| n.parent_id == 0)
 }
 
+/// Level-play counterpart of `is_subtree_active_for_monitor`: a `QuestFailed` monitor only
+/// runs while `step_level_play_node` reaches it, i.e. no ancestor has finished and, under a
+/// `Sequence`, every earlier sibling has completed (a Sequence stops at its first unfinished
+/// child).
+pub fn is_lp_failed_monitor_active(
+    progress_comp: Option<&PlayerProgressComponent>,
+    lp_id: i32,
+    nodes: &[NodeEntry],
+    node: &NodeEntry,
+) -> bool {
+    if is_level_play_node_marked(progress_comp, lp_id, node.id) {
+        return false;
+    }
+    let mut cur = node;
+    for _ in 0..32 {
+        if cur.parent_id <= 0 {
+            return true;
+        }
+        let Some(parent) = find_lp_node_by_id(nodes, cur.parent_id) else {
+            return false;
+        };
+        if is_level_play_node_marked(progress_comp, lp_id, parent.id) {
+            return false;
+        }
+        if parent.node_type == "Sequence"
+            && nodes.iter().take_while(|n| n.id != cur.id).any(|n| {
+                n.parent_id == parent.id && !is_level_play_node_marked(progress_comp, lp_id, n.id)
+            })
+        {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
 fn resolve_level_play_anchor_pos<S: PushSink + ?Sized>(
     ctx: &LevelPlayContext<'_, S>,
     lp: &LevelPlayData,
@@ -2748,7 +2784,13 @@ pub fn on_fail_timer_due<S: PushSink + ?Sized>(
     let Ok(nodes) = ctx.assets.level_play_nodes.get_owner_nodes(lp_id) else {
         return Ok(false);
     };
-    if let Some(node) = find_lp_node_by_id(&nodes, node_id)
+    let node = find_lp_node_by_id(&nodes, node_id);
+    if node.is_some_and(|n| {
+        !is_lp_failed_monitor_active(ctx.progress_comp.as_deref(), lp_id, &nodes, n)
+    }) {
+        return Ok(false);
+    }
+    if let Some(node) = node
         && let Some(fa) = node.data.get("FinishActions")
     {
         run_level_play_actions(ctx, lp_id, node.id, Some(fa), None);
@@ -3146,6 +3188,9 @@ pub fn on_player_move<S: PushSink + ?Sized>(
         } else {
             for node in nodes.iter() {
                 if node.node_type != "QuestFailed" {
+                    continue;
+                }
+                if !is_lp_failed_monitor_active(ctx.progress_comp.as_deref(), lp_id, &nodes, node) {
                     continue;
                 }
                 let fail_reason = {

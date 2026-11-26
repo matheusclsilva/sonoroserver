@@ -3372,6 +3372,14 @@ pub fn on_player_transfer_or_leave_inst<S: PushSink + ?Sized>(
                 if node.node_type != "QuestFailed" {
                     continue;
                 }
+                if !level_play::is_lp_failed_monitor_active(
+                    lp_ctx.progress_comp.as_deref(),
+                    lpid,
+                    &nodes,
+                    node,
+                ) {
+                    continue;
+                }
                 let Some(Value::Object(fc)) = node.data.get("FailedCondition") else {
                     continue;
                 };

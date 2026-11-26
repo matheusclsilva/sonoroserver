@@ -5310,3 +5310,133 @@ fn audit_121_elevator_forward_reverse_drive_rise_fall_entity_state() {
         "a missing State (wire default End) must dock the lift"
     );
 }
+
+#[test]
+fn audit_122_level_play_quest_failed_monitor_only_while_branch_active() {
+    use sonoro_proto::pb::TeleportNotify;
+
+    // LevelPlay 141000006: 1 Sequence > 12 Sequence > [2 CheckEntityState 141000436 激活,
+    // 128 Timer 3 s, 105 Action, 129 ParallelSelect > 6 Sequence > 32 ParallelSelect >
+    // 33 QuestFailed {IsTransferFailure, RangeLimiting 19501}]; node 33 FinishActions
+    // SetPlayerPos to the pedestal (41027.83, 260031.45). Anchor 32000402, EnterRadius 307 m.
+    const ECHO_LP: i32 = 141_000_006;
+    const ECHO_ANCHOR: [f32; 3] = [56_877.02, 258_948.63, 1_101.0];
+    // LevelPlay 124000079: 1 Sequence > 13 Sequence > [12 CheckEntityState 124003592 激活,
+    // 24 Timer 3 s, 4 ParallelSelect > 6 Sequence > 11 QuestFailed {Timer 120 CountDownChallenge}].
+    // LevelPlay 122000234 shares anchor 32000031 and has QuestFailed 11 {Timer 30} behind node 2.
+    const PARKOUR_LP: i32 = 124_000_079;
+    const SAMPLE_LP: i32 = 122_000_234;
+    const PARKOUR_FAIL_NODE: i32 = 11;
+    const PARKOUR_ANCHOR: [f32; 3] = [-37_329.65, 114_375.45, 4_519.92];
+
+    fn move_to(h: &mut TestHarness, events: &mut EventQueue, pos: [f32; 3]) {
+        let mut qctx = h.state.quest_context(events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::on_player_move(&mut lctx, pos[0], pos[1], pos[2]).expect("lp move");
+    }
+    fn transfer(h: &mut TestHarness, events: &mut EventQueue) {
+        quest_engine::on_player_transfer_or_leave_inst(&mut h.state.quest_context(events), false)
+            .expect("transfer");
+    }
+    fn pedestal_teleports(h: &mut TestHarness) -> usize {
+        h.drain_decoded::<TeleportNotify>(TeleportNotify::MSG_ID)
+            .iter()
+            .filter(|n| {
+                n.Pos.as_ref().is_some_and(|p| {
+                    (p.X - 41_027.83).abs() < 1.0 && (p.Y - 260_031.45).abs() < 1.0
+                })
+            })
+            .count()
+    }
+    fn entered(h: &TestHarness, lp_id: i32) -> bool {
+        h.state.player_components.quest.info.progress.entered_level_plays.contains(&lp_id)
+    }
+    fn fail_timer_due(h: &TestHarness, lp_id: i32) -> Option<i64> {
+        h.state.scene.as_ref().unwrap().lp_fail_timers.get_due_ms(lp_id, PARKOUR_FAIL_NODE)
+    }
+
+    // (i) Entered, pedestal not activated yet (node 2 running): a transfer must not run node 33.
+    let mut h = TestHarness::new("audit122a", Some(8));
+    let mut events = EventQueue::new();
+    move_to(&mut h, &mut events, ECHO_ANCHOR);
+    assert!(entered(&h, ECHO_LP));
+    let pc = &h.state.player_components.progress.info;
+    assert_eq!(pc.get_key_int("lp_act:141000006:2"), 1);
+    assert_eq!(pc.get_key_int("lp_node:141000006:2"), 0);
+    let _ = h.drain_count();
+    transfer(&mut h, &mut events);
+    assert_eq!(
+        pedestal_teleports(&mut h),
+        0,
+        "QuestFailed 33 must not SetPlayerPos while its branch (node 32) is not running"
+    );
+    assert!(entered(&h, ECHO_LP), "an inactive QuestFailed must not fail LevelPlay {ECHO_LP}");
+
+    // Pedestal activated, 3 s countdown and node 105 done: Sequence 12 has reached 129 > 6 > 32.
+    let pc = &mut h.state.player_components.progress.info;
+    pc.set_key_int("lp_act:141000006:2", 0);
+    for nid in [2, 128, 105] {
+        pc.set_key_int(&format!("lp_node:{ECHO_LP}:{nid}"), 1);
+    }
+    let _ = h.drain_count();
+    transfer(&mut h, &mut events);
+    assert_eq!(pedestal_teleports(&mut h), 1, "running QuestFailed 33 must fail on transfer");
+    assert!(!entered(&h, ECHO_LP));
+
+    // (ii) Entered, challenge not started (node 12 running): a move must not arm the fail timer.
+    let mut h = TestHarness::new("audit122b", Some(8));
+    let mut events = EventQueue::new();
+    move_to(&mut h, &mut events, PARKOUR_ANCHOR);
+    for lp_id in [PARKOUR_LP, SAMPLE_LP] {
+        assert!(entered(&h, lp_id), "LevelPlay {lp_id} must enter at anchor 32000031");
+        assert_eq!(
+            fail_timer_due(&h, lp_id),
+            None,
+            "LevelPlay {lp_id} QuestFailed 11 must not count down before the challenge starts"
+        );
+    }
+
+    // A fail timer left over from an inactive branch must not fire.
+    h.state.scene.as_mut().unwrap().lp_fail_timers.upsert(QuestTimerEntry {
+        quest_id: PARKOUR_LP,
+        node_id: PARKOUR_FAIL_NODE,
+        due_ms: 1,
+    });
+    quest_engine::tree::on_timers_due(
+        &mut h.state.quest_context(&mut events),
+        quest_engine::now_ms_pub(),
+    )
+    .expect("timers due");
+    assert!(entered(&h, PARKOUR_LP), "stale fail timer of an inactive QuestFailed must be ignored");
+
+    // Pedestal 124003592 activated: Sequence 13 now waits on the 3 s GameStartCountDown node 24,
+    // so QuestFailed 11 is still not running.
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(124_003_592, "关卡.Common.状态.激活");
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::step_entered_tree_by_id(&mut lctx, PARKOUR_LP).expect("step parkour");
+    }
+    let pc = &h.state.player_components.progress.info;
+    assert_eq!(pc.get_key_int("lp_node:124000079:12"), 1);
+    assert_eq!(pc.get_key_int("lp_act:124000079:24"), 1);
+    move_to(&mut h, &mut events, PARKOUR_ANCHOR);
+    assert_eq!(fail_timer_due(&h, PARKOUR_LP), None, "no 120 s countdown during node 24");
+
+    // Countdown 24 ends: Sequence 13 reaches ParallelSelect 4, so 11 runs and arms 120 s.
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        assert!(level_play::on_timer_due(&mut lctx, PARKOUR_LP, 24).expect("node 24 timer"));
+    }
+    let due = fail_timer_due(&h, PARKOUR_LP).expect("running QuestFailed 11 must arm its timer");
+    let left_ms = due - quest_engine::now_ms_pub();
+    assert!((119_000..=120_000).contains(&left_ms), "120 s countdown, got {left_ms} ms");
+    move_to(&mut h, &mut events, PARKOUR_ANCHOR);
+    assert_eq!(fail_timer_due(&h, PARKOUR_LP), Some(due));
+    assert!(entered(&h, PARKOUR_LP));
+}
