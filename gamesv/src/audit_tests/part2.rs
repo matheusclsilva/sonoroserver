@@ -6257,3 +6257,90 @@ fn audit_129_change_phantom_formation_switches_scene_team_to_echo_group() {
     run(&mut h, &mut events, RESTORE);
     assert!(drain_push_frames(&mut h).is_empty());
 }
+
+#[test]
+fn audit_130_switch_role_to_echo_in_phantom_group_and_back_on_restore() {
+    use crate::network::handlers::role::handle_switch_role_request;
+    use sonoro_proto::pb::SwitchRoleRequest;
+
+    // After SwitchSceneGroupNotify {Group 2} the client's TeamGoBattle sends SwitchRoleRequest
+    // for the Phantom group's current role (SceneTeamModel.cs:465-468).
+    const BATTLE_ROLE: i32 = 1102;
+    const ECHO_ROLE: i32 = 5_001_001;
+    const CHANGE: &str = r#"{"Name":"ChangePhantomFormation","Params":{"FormationId":1,"AppendBuffIds":[631410001]}}"#;
+    const RESTORE: &str = r#"{"Name":"RestorePhantomFormation","Params":{}}"#;
+
+    fn run(h: &mut TestHarness, events: &mut EventQueue, raw: &str) {
+        let act: Value = serde_json::from_str(raw).unwrap();
+        let mut qctx = h.state.quest_context(events);
+        let mut cbs = ActionCallbacks::default();
+        execute_action(&mut qctx, &mut cbs, 141_000_006, 2, &act).unwrap();
+    }
+    fn switch(h: &mut TestHarness, role_id: i32) -> Option<ErrorCode> {
+        let req = SwitchRoleRequest {
+            RoleId: role_id,
+            ..Default::default()
+        };
+        handle_switch_role_request(&mut h.state, req).ErrorCode
+    }
+
+    let mut h = TestHarness::new("audit130", Some(8));
+    let mut events = EventQueue::new();
+    let battle_eid = {
+        let sc = h.state.scene.as_mut().unwrap();
+        let mut storage = EntityComponentStorage::new(
+            110_201,
+            ConfigComponent {
+                camp: 1,
+                config_id: BATTLE_ROLE,
+                config_type: ConfigType::Character,
+                entity_type: EntityType::Player,
+                state: EntityState::Default,
+            },
+        );
+        storage.visible = true;
+        let ent = sc.spawn_with_net_id(110_201, storage).unwrap();
+        sc.formation_info.cur_formation = 0;
+        sc.formation_info.formations[0].cur_role = BATTLE_ROLE;
+        sc.formation_info.formations[0].roles[0] = Some(FormationRole {
+            role_id: BATTLE_ROLE,
+            entity_id: ent.net_id,
+            ..Default::default()
+        });
+        ent.net_id
+    };
+    assert_eq!(
+        switch(&mut h, ECHO_ROLE),
+        Some(ErrorCode::SwitchRoleNotInCurrentFormation),
+        "no Echo group yet"
+    );
+
+    run(&mut h, &mut events, CHANGE);
+    let _ = h.drain_count();
+    let scene = h.state.scene.as_ref().unwrap();
+    let echo_eid = scene.phantom_role_entity_id(ECHO_ROLE).expect("Echo role entity");
+    assert_eq!(scene.current_role_entity_id(), battle_eid, "until the client switches");
+
+    assert_eq!(switch(&mut h, ECHO_ROLE), Some(ErrorCode::Success));
+    let scene = h.state.scene.as_ref().unwrap();
+    assert_eq!(scene.current_role_entity_id(), echo_eid);
+    assert_eq!(scene.formation_info.formations[0].cur_role, BATTLE_ROLE, "battle cur_role kept");
+    assert!(!scene.entity(battle_eid).unwrap().visible);
+    assert!(scene.entity(echo_eid).unwrap().visible);
+    // The same request again (CheckCurrentRoleRequest / a second TeamGoBattle) is fine.
+    assert_eq!(switch(&mut h, ECHO_ROLE), Some(ErrorCode::Success));
+
+    run(&mut h, &mut events, RESTORE);
+    let _ = h.drain_count();
+    let scene = h.state.scene.as_ref().unwrap();
+    assert_eq!(scene.current_role_entity_id(), battle_eid, "back to the battle role");
+    assert_eq!(scene.phantom_cur_role, 0);
+    assert!(scene.entity(battle_eid).unwrap().visible);
+    assert_eq!(
+        switch(&mut h, ECHO_ROLE),
+        Some(ErrorCode::SwitchRoleNotInCurrentFormation),
+        "the Echo group is gone"
+    );
+    // The client's TeamGoBattle for the Battle group then asks for the battle role.
+    assert_eq!(switch(&mut h, BATTLE_ROLE), Some(ErrorCode::Success));
+}

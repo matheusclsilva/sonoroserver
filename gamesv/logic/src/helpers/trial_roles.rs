@@ -1002,8 +1002,9 @@ pub fn change_phantom_formation<S: PushSink + ?Sized>(
 
 /// RestorePhantomFormation (server action): back to the Battle group, then the Echo role
 /// entities and their trial role data go. The client's own SceneTeamController.RevertPhantomTeam
-/// also only switches to Battle, and only while the Phantom group is in use. Trial roles in
-/// `keep_trial_ids` (from AddTrialCharacter) keep their data.
+/// also only switches to Battle, and only while the Phantom group is in use. The current role
+/// goes back to the battle formation's cur_role. Trial roles in `keep_trial_ids` (from
+/// AddTrialCharacter) keep their data.
 pub fn restore_phantom_formation<S: PushSink + ?Sized>(
     scene: &mut Scene,
     fs: &FileSystem,
@@ -1016,6 +1017,12 @@ pub fn restore_phantom_formation<S: PushSink + ?Sized>(
     let entity_ids = std::mem::take(&mut scene.phantom_role_entity_ids);
     if entity_ids.is_empty() {
         return;
+    }
+    if std::mem::take(&mut scene.phantom_cur_role) > 0 {
+        let battle_eid = scene.current_role_entity_id();
+        if let Some(s) = scene.entity_mut(battle_eid) {
+            s.visible = true;
+        }
     }
     sink.push(
         SwitchSceneGroupNotify::MSG_ID,

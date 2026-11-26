@@ -255,6 +255,8 @@ pub struct Scene {
     pub plot_saved_slot_entity_id: i64,
     /// Role entities of the Echo (Phantom) group while ChangePhantomFormation is in effect.
     pub phantom_role_entity_ids: Vec<i64>,
+    /// Role of the Echo group the client switched to (SwitchRoleRequest); 0 = the battle role.
+    pub phantom_cur_role: i32,
     pub pending_flows: Vec<ScenePendingFlow>,
     pub quest_timers: QuestTimerQueue,
     pub lp_timers: QuestTimerQueue,
@@ -346,6 +348,7 @@ impl Scene {
             plot_saved_slot_role_id: 0,
             plot_saved_slot_entity_id: -1,
             phantom_role_entity_ids: Vec::new(),
+            phantom_cur_role: 0,
             pending_flows: Vec::new(),
             quest_timers: QuestTimerQueue::new(),
             lp_timers: QuestTimerQueue::new(),
@@ -1670,7 +1673,20 @@ impl Scene {
         true
     }
 
+    /// Echo (Phantom) group role entity of `role_id`, while ChangePhantomFormation is in effect.
+    pub fn phantom_role_entity_id(&self, role_id: i32) -> Option<i64> {
+        self.phantom_role_entity_ids
+            .iter()
+            .copied()
+            .find(|&eid| self.entity(eid).is_some_and(|s| s.config.config_id == role_id))
+    }
+
     pub fn current_role_entity_id(&self) -> i64 {
+        if self.phantom_cur_role > 0
+            && let Some(eid) = self.phantom_role_entity_id(self.phantom_cur_role)
+        {
+            return eid;
+        }
         let Ok(idx) = usize::try_from(self.formation_info.cur_formation) else {
             return -1;
         };

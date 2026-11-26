@@ -552,7 +552,32 @@ fn role_in_current_formation(scene: &Scene, role_id: i32) -> bool {
         .is_some_and(|f| f.roles.iter().flatten().any(|r| r.role_id == role_id))
 }
 
+/// Switch to a role of the Echo (Phantom) group. After SwitchSceneGroupNotify {Group 2} the
+/// client's TeamGoBattle sends SwitchRoleRequest for the group's current role
+/// (SceneTeamModel.cs:465-468, SceneTeamController.SendSwitchRole :313-323); the Echo is not in
+/// the battle formation, whose cur_role is kept for RestorePhantomFormation.
+fn apply_phantom_role_switch(scene: &mut Scene, role_id: i32) -> bool {
+    let Some(up_eid) = scene.phantom_role_entity_id(role_id) else {
+        return false;
+    };
+    let down_eid = scene.current_role_entity_id();
+    if down_eid == up_eid {
+        return false;
+    }
+    scene.phantom_cur_role = role_id;
+    if let Some(storage) = scene.entity_mut(down_eid) {
+        storage.visible = false;
+    }
+    if let Some(storage) = scene.entity_mut(up_eid) {
+        storage.visible = true;
+    }
+    true
+}
+
 fn apply_active_role_switch(scene: &mut Scene, role_id: i32) -> bool {
+    if scene.phantom_role_entity_id(role_id).is_some() {
+        return apply_phantom_role_switch(scene, role_id);
+    }
     if !role_in_current_formation(scene, role_id) {
         return false;
     }
@@ -591,7 +616,9 @@ pub fn handle_switch_role_request(
             RoleId: req.RoleId,
         };
     };
-    if !role_in_current_formation(scene, req.RoleId) {
+    if scene.phantom_role_entity_id(req.RoleId).is_none()
+        && !role_in_current_formation(scene, req.RoleId)
+    {
         return SwitchRoleResponse {
             ErrorCode: Some(ErrorCode::SwitchRoleNotInCurrentFormation),
             RoleId: req.RoleId,
