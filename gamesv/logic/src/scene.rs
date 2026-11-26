@@ -263,6 +263,9 @@ pub struct Scene {
     pub fail_timers: QuestTimerQueue,
     pub lp_fail_timers: QuestTimerQueue,
     pub sent_lp_bt_trees: HashSet<i32>,
+    /// (LevelPlay, node) of the Sequence / ParallelSelect / QuestFailed nodes that are running
+    /// (Activated for the client). ChildQuest and Action nodes use the `lp_act` progress keys.
+    pub lp_active_logic_nodes: HashSet<(i32, i32)>,
     pub lp_repeater_cooldowns: HashMap<i64, i64>,
     pub bt_timers: Vec<ActiveBtTimer>,
     pub bt_occupations: Vec<BtOccupation>,
@@ -355,6 +358,7 @@ impl Scene {
             fail_timers: QuestTimerQueue::new(),
             lp_fail_timers: QuestTimerQueue::new(),
             sent_lp_bt_trees: HashSet::new(),
+            lp_active_logic_nodes: HashSet::new(),
             lp_repeater_cooldowns: HashMap::new(),
             bt_timers: Vec::new(),
             bt_occupations: Vec::new(),

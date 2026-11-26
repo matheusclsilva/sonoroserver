@@ -8,7 +8,7 @@ use sonoro_gamesv_fs::quest_info::append_unique_int;
 use sonoro_proto::enums::{BtType, ChildQuestNodeStatus, ErrorCode, FailReason, TimerSetType};
 use sonoro_proto::pb::{
     BtRollbackStartNotify, FlowEndNotify, FlowOptionInfoList, LordGymLevelPlayResultNotify,
-    QuestGiveUpNotify, TimerInfoPb, TowerEndNotify, TowerFloorPb, TowerFloorUpdateNotify,
+    QuestGiveUpNotify, TowerEndNotify, TowerFloorPb, TowerFloorUpdateNotify,
     TowerRolePb, UpdateChildQuestNodeStatusNotify, UpdateTimerInfoNotify,
 };
 
@@ -3241,12 +3241,8 @@ pub fn on_bt_set_timer_info<S: PushSink + ?Sized>(
         &UpdateTimerInfoNotify {
             TreeOwnerId: owner_id,
             TreeIncId: inc_id,
-            TimerInfo: Some(TimerInfoPb {
-                TimerType: bt.timer_type.into_bytes(),
-                NodeId: bt.node_id,
-                EndTime: bt.end_time_ms / 1000,
-                PauseTime: bt.pause_time_ms,
-            }),
+            // EndTime in ms, like the server time stamp CountDownTimer.GetRemainTime subtracts.
+            TimerInfo: Some(bt.to_proto()),
         },
     );
     Ok(())
@@ -3291,7 +3287,7 @@ pub fn on_bt_timer_end<S: PushSink + ?Sized>(
         } else if ctx.quest_comp.info.progress.entered_level_plays.contains(&owner_id)
             && let Some(mut lp_ctx) = LevelPlayContext::from_quest_ctx(ctx)
         {
-            let _ = level_play::on_bt_timer_end(&mut lp_ctx, owner_id)?;
+            let _ = level_play::on_bt_timer_end(&mut lp_ctx, owner_id, timer_type)?;
         }
     }
     Ok(())

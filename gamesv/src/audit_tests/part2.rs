@@ -224,7 +224,8 @@ fn audit_98_3d_scale_shapes_rotation_remove_claim_and_level_play_control() {
     {
         let mut qctx = h.state.quest_context(&mut events);
         let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
-        let _ = level_play::on_bt_timer_end(&mut lctx, 2_000_033).expect("lp bt timer end");
+        let _ = level_play::on_bt_timer_end(&mut lctx, 2_000_033, "CountDownChallenge")
+            .expect("lp bt timer end");
     }
     assert_eq!(h.state.player_components.progress.info.get_key_int("lp_node:2000033:5"), 1);
     quest_engine::on_forced_occupation(&mut h.state.quest_context(&mut events), 2_000_033)
@@ -797,7 +798,8 @@ fn audit_101_deep_audit_talk_flow_interact_always_false_and_world_3d_sync() {
             || m == sonoro_proto::pb::ActionNotify::MSG_ID
     });
     assert!(!update_before);
-    assert!(lp316_ids.len() < 20);
+    // Includes Activated for Sequence 1 / ParallelSelect 4 / Sequence 7 and node 5's timer.
+    assert!(lp316_ids.len() < 24, "{lp316_ids:?}");
 }
 
 #[test]
@@ -6343,4 +6345,151 @@ fn audit_130_switch_role_to_echo_in_phantom_group_and_back_on_restore() {
     );
     // The client's TeamGoBattle for the Battle group then asks for the battle role.
     assert_eq!(switch(&mut h, BATTLE_ROLE), Some(ErrorCode::Success));
+}
+
+#[test]
+fn audit_131_level_play_challenge_hud_nodes_activate_and_timers_reach_client() {
+    use sonoro_proto::enums::NodeStatus;
+    use sonoro_proto::pb::{UpdateNodeStatusNotify, UpdateTimerInfoNotify};
+    use sonoro_proto::wire::PbMessage;
+
+    // LevelPlay 124000079 全息跑酷_线路2: 1 Sequence > 13 Sequence > [12 CheckEntityState
+    // 124003592 激活, 24 Timer 3 s GameStartCountDown, 4 ParallelSelect {UIConfig UiType
+    // LevelPlay} > [6 Sequence > 11 QuestFailed {Timer 120 CountDownChallenge, RangeLimiting
+    // 11000}, 23 ParallelSelect > [5 > 8 ReachArea, 19 > 20/22/21 ReachArea]]].
+    const LP: i32 = 124_000_079;
+    const ANCHOR: [f32; 3] = [-37_329.65, 114_375.45, 4_519.92];
+
+    fn move_to(h: &mut TestHarness, events: &mut EventQueue, pos: [f32; 3]) {
+        let mut qctx = h.state.quest_context(events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::on_player_move(&mut lctx, pos[0], pos[1], pos[2]).expect("lp move");
+    }
+    fn of<M: PbMessage>(frames: &[(u16, Vec<u8>)], id: u16) -> Vec<(usize, M)> {
+        frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.0 == id)
+            .map(|(i, f)| (i, M::decode(&f.1).unwrap()))
+            .collect()
+    }
+    fn statuses(frames: &[(u16, Vec<u8>)], status: NodeStatus) -> Vec<(usize, i32)> {
+        of::<UpdateNodeStatusNotify>(frames, UpdateNodeStatusNotify::MSG_ID)
+            .into_iter()
+            .filter(|(_, n)| n.TreeIncId == i64::from(LP) && n.Status == Some(status))
+            .map(|(i, n)| (i, n.NodeId))
+            .collect()
+    }
+    fn timers(frames: &[(u16, Vec<u8>)]) -> Vec<(usize, String, i32, i64)> {
+        of::<UpdateTimerInfoNotify>(frames, UpdateTimerInfoNotify::MSG_ID)
+            .into_iter()
+            .filter(|(_, n)| (n.TreeOwnerId, n.TreeIncId) == (LP, i64::from(LP)))
+            .map(|(i, n)| {
+                let t = n.TimerInfo.unwrap();
+                (i, String::from_utf8(t.TimerType).unwrap(), t.NodeId, t.EndTime)
+            })
+            .collect()
+    }
+    /// Enters the play, activates the start pedestal and lets the 3 s countdown 24 end.
+    fn start_challenge(h: &mut TestHarness, events: &mut EventQueue) -> Vec<(u16, Vec<u8>)> {
+        move_to(h, events, ANCHOR);
+        let frames = drain_push_frames(h);
+        let tree = of::<BehaviorTreeInfoNotify>(&frames, BehaviorTreeInfoNotify::MSG_ID)
+            .into_iter()
+            .flat_map(|(_, n)| n.TreeInfos)
+            .find(|t| t.TreeIncId == i64::from(LP))
+            .expect("BehaviorTreeInfoNotify for the parkour");
+        // The boot step runs without pushes, so the running composites go in TreeInfo.Nodes.
+        for nid in [1, 13] {
+            assert_eq!(tree.Nodes.get(&nid).and_then(|n| n.Status), Some(NodeStatus::Activate));
+        }
+        assert!(!tree.Nodes.contains_key(&4) && !tree.Nodes.contains_key(&11));
+
+        h.state
+            .player_components
+            .quest
+            .info
+            .set_entity_state(124_003_592, "关卡.Common.状态.激活");
+        {
+            let mut qctx = h.state.quest_context(events);
+            let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+            level_play::step_entered_tree_by_id(&mut lctx, LP).expect("step parkour");
+        }
+        let frames = drain_push_frames(h);
+        let started = timers(&frames);
+        assert_eq!(started.len(), 1, "{started:?}");
+        let left_ms = started[0].3 - quest_engine::now_ms_pub();
+        assert_eq!((started[0].1.as_str(), started[0].2), ("GameStartCountDown", 24));
+        assert!((2_000..=3_000).contains(&left_ms), "EndTime in ms, got {left_ms} ms left");
+        {
+            let mut qctx = h.state.quest_context(events);
+            let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+            assert!(level_play::on_timer_due(&mut lctx, LP, 24).expect("node 24 timer"));
+        }
+        drain_push_frames(h)
+    }
+
+    let mut h = TestHarness::new("audit131a", Some(8));
+    let mut events = EventQueue::new();
+    let frames = start_challenge(&mut h, &mut events);
+    let active = statuses(&frames, NodeStatus::Activate);
+    let pos_of = |nid: i32| active.iter().find(|(_, n)| *n == nid).map(|(i, _)| *i);
+    let hud_pos = pos_of(4).expect("ParallelSelect 4 (UIConfig) pushed Activated");
+    let fail_pos = pos_of(11).expect("QuestFailed 11 pushed Activated");
+    assert!(pos_of(6).is_some());
+    assert_eq!(active.iter().filter(|(_, n)| [4, 11].contains(n)).count(), 2, "{active:?}");
+    let due = h.state.scene.as_ref().unwrap().lp_fail_timers.get_due_ms(LP, 11).expect("armed");
+    let ts = timers(&frames);
+    assert!(
+        ts.iter().any(|t| (t.1.as_str(), t.2, t.3) == ("GameStartCountDown", 24, 0)),
+        "node 24 done: its timer ends, {ts:?}"
+    );
+    let (timer_pos, _, _, end) = ts
+        .iter()
+        .find(|t| t.1 == "CountDownChallenge")
+        .cloned()
+        .expect("UpdateTimerInfoNotify for the 120 s CountDownChallenge");
+    assert_eq!(end, due);
+    let left_ms = end - quest_engine::now_ms_pub();
+    assert!((119_000..=120_000).contains(&left_ms), "120 s, got {left_ms} ms");
+    assert!(hud_pos < fail_pos && fail_pos < timer_pos, "node 11 exists before its timer");
+
+    // Moving inside the range again sends neither the activations nor the timer again.
+    move_to(&mut h, &mut events, ANCHOR);
+    let frames = drain_push_frames(&mut h);
+    assert!(statuses(&frames, NodeStatus::Activate).is_empty());
+    assert!(timers(&frames).is_empty());
+
+    // Run finished: 4 completes (ParallelSelect Count 1), 11 is destroyed and its timer ends.
+    for pos in [
+        [-25_872.18, 119_766.66, 11_581.84],
+        [-32_144.06, 116_876.5, 8_190.0],
+        [-29_417.89, 116_951.81, 10_100.0],
+        [-27_284.97, 117_652.79, 11_580.0],
+    ] {
+        move_to(&mut h, &mut events, pos);
+    }
+    let frames = drain_push_frames(&mut h);
+    assert!(h.state.player_components.quest.info.completed_level_plays.contains(&LP));
+    assert!(statuses(&frames, NodeStatus::Destroy).iter().any(|(_, n)| *n == 11));
+    assert!(statuses(&frames, NodeStatus::CompletedSuccess).iter().any(|(_, n)| *n == 4));
+    let ended = timers(&frames);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!((ended[0].1.as_str(), ended[0].2, ended[0].3), ("CountDownChallenge", 11, 0));
+
+    // Leaving the 11000 range fails the run (OutRangeFail) and ends the countdown too.
+    let mut h = TestHarness::new("audit131b", Some(8));
+    let mut events = EventQueue::new();
+    let _ = start_challenge(&mut h, &mut events);
+    move_to(&mut h, &mut events, ANCHOR);
+    let _ = h.drain_count();
+    move_to(&mut h, &mut events, [-18_339.8, 120_149.07, 4_910.53]);
+    let frames = drain_push_frames(&mut h);
+    let entered = &h.state.player_components.quest.info.progress.entered_level_plays;
+    assert!(!entered.contains(&LP), "out of RangeLimiting fails LevelPlay {LP}");
+    let ended = timers(&frames);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!((ended[0].1.as_str(), ended[0].2, ended[0].3), ("CountDownChallenge", 11, 0));
+    let bt_timers = &h.state.scene.as_ref().unwrap().bt_timers;
+    assert!(!bt_timers.iter().any(|t| t.owner_id == LP), "{bt_timers:?}");
 }

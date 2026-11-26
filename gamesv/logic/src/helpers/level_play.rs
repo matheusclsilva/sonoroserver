@@ -17,7 +17,7 @@ use sonoro_proto::pb::{
     ChildQuestNodeInfo, EnterLevelPlayNotify, EntityAddNotify, EntityRemoveInfo,
     EntityRemoveNotify, LeaveLevelPlayNotify, LevelPlayFirstNotify, LevelPlayInfo,
     LevelPlayInfoNotify, LevelPlayStateNotify, NodeInfo, NodeInfoExtraInfoOneof, TimerInfoPb,
-    TreeInfo, UpdateNodeStatusNotify,
+    TreeInfo, UpdateNodeStatusNotify, UpdateTimerInfoNotify,
 };
 
 use crate::component::entity::small::{
@@ -302,6 +302,9 @@ fn set_lp_node_active<S: PushSink + ?Sized>(
     active: bool,
     dirty_pc: &mut bool,
 ) {
+    if !active {
+        ctx.scene.lp_active_logic_nodes.remove(&(lp_id, node_id));
+    }
     let Some(pc) = ctx.progress_comp.as_deref_mut() else {
         return;
     };
@@ -331,6 +334,7 @@ fn mark_lp_node_finished<S: PushSink + ?Sized>(
     node_id: i32,
     dirty_pc: &mut bool,
 ) {
+    ctx.scene.lp_active_logic_nodes.remove(&(lp_id, node_id));
     let Some(pc) = ctx.progress_comp.as_deref_mut() else {
         return;
     };
@@ -431,6 +435,180 @@ pub fn is_lp_failed_monitor_active(
         cur = parent;
     }
     false
+}
+
+/// Node types the client builds a node object for besides ChildQuest (NodeTypeDefine.NewNodeObj):
+/// Sequence / ParallelSelect are LogicNodeBase, whose OnNodeActive adds EBehaviorTreeTag.CanShow
+/// when the node has a UIConfig (TrackTextExpressController then shows that UIConfig, and tags
+/// the tree ChallengeUi for UiType LevelPlay); QuestFailedBehaviorNode.OnNodeActive starts the
+/// RangeLimiting effect. The client only learns their status from UpdateNodeStatusNotify or
+/// TreeInfo.Nodes.
+fn is_client_logic_node(node_type: &str) -> bool {
+    matches!(node_type, "Sequence" | "ParallelSelect" | "QuestFailed")
+}
+
+/// Marks a Sequence / ParallelSelect / QuestFailed node as running and sends it Activated the
+/// first time.
+fn activate_lp_logic_node<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    node: &NodeEntry,
+    push_updates: bool,
+) {
+    if !is_client_logic_node(&node.node_type)
+        || !ctx.scene.lp_active_logic_nodes.insert((lp_id, node.id))
+    {
+        return;
+    }
+    if push_updates {
+        ctx.sink.push(
+            UpdateNodeStatusNotify::MSG_ID,
+            &UpdateNodeStatusNotify {
+                TreeOwnerId: lp_id,
+                TreeIncId: i64::from(lp_id),
+                NodeId: node.id,
+                Status: Some(NodeStatus::Activate),
+            },
+        );
+    }
+}
+
+/// `TimerType` of a node's timer: ChildQuest `Condition {Type Timer, TimerType}` or QuestFailed
+/// `FailedCondition.Timer.TimerType`.
+fn lp_node_timer_type(node: &NodeEntry) -> Option<&str> {
+    let timer = if node.node_type == "QuestFailed" {
+        node.data.get("FailedCondition")?.get("Timer")?.as_object()?
+    } else {
+        let cond = quest_engine::get_child_condition_pub(&node.data)?;
+        if json_str(cond.get("Type")) != Some("Timer") {
+            return None;
+        }
+        cond
+    };
+    json_str(timer.get("TimerType")).filter(|t| !t.is_empty())
+}
+
+/// Starts the client's timer of a node whose timer the server armed (due at `due_ms`).
+/// UpdateTimerInfoNotify -> BaseBehaviorTree.UpdateTimer -> BehaviorTreeTimerCenter
+/// .UpdateTimerInfo: CountDownChallenge / PublicTime / BehaviorTreeTimer1-5 become a
+/// CountDownTimer, whose UI comes from the node's TimerUiConfig (so the node is sent first);
+/// WaitTime a NoUiTimer. EndTime is a server time stamp in ms: both GetRemainTime compute
+/// (EndTime - server time) / 1000. The timer is kept in Scene::bt_timers, which
+/// BtSetTimerInfoRequest adjusts.
+fn start_lp_node_timer<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    node: &NodeEntry,
+    due_ms: i64,
+    push_updates: bool,
+) {
+    let Some(timer_type) = lp_node_timer_type(node) else {
+        return;
+    };
+    let inc_id = i64::from(lp_id);
+    if ctx
+        .scene
+        .bt_timers
+        .iter()
+        .any(|t| t.owner_id == lp_id && t.inc_id == inc_id && t.timer_type == timer_type)
+    {
+        return;
+    }
+    let timer = ctx.scene.upsert_bt_timer(lp_id, inc_id, node.id, timer_type, due_ms);
+    if push_updates {
+        ctx.sink.push(
+            UpdateTimerInfoNotify::MSG_ID,
+            &UpdateTimerInfoNotify {
+                TreeOwnerId: lp_id,
+                TreeIncId: inc_id,
+                TimerInfo: Some(timer.to_proto()),
+            },
+        );
+    }
+}
+
+/// EndTime 0 ends a client timer (BehaviorTreeTimerCenter.EndShowTimer). Otherwise a node that
+/// stops early leaves a CountDownTimer that sends TimerEndRequest when it runs out.
+fn push_lp_timer_end<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    node_id: i32,
+    timer_type: &str,
+) {
+    ctx.sink.push(
+        UpdateTimerInfoNotify::MSG_ID,
+        &UpdateTimerInfoNotify {
+            TreeOwnerId: lp_id,
+            TreeIncId: i64::from(lp_id),
+            TimerInfo: Some(TimerInfoPb {
+                TimerType: timer_type.as_bytes().to_vec(),
+                NodeId: node_id,
+                EndTime: 0,
+                PauseTime: 0,
+            }),
+        },
+    );
+}
+
+fn end_lp_node_timer<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    node: &NodeEntry,
+    push_updates: bool,
+) {
+    let Some(timer_type) = lp_node_timer_type(node) else {
+        return;
+    };
+    if ctx.scene.remove_bt_timer(lp_id, i64::from(lp_id), timer_type) && push_updates {
+        push_lp_timer_end(ctx, lp_id, node.id, timer_type);
+    }
+}
+
+/// Ends every client timer of a level play whose tree completes, closes or rolls back.
+fn end_lp_timers<S: PushSink + ?Sized>(ctx: &mut LevelPlayContext<'_, S>, lp_id: i32) {
+    let inc_id = i64::from(lp_id);
+    let ended: Vec<(i32, String)> = ctx
+        .scene
+        .bt_timers
+        .iter()
+        .filter(|t| t.owner_id == lp_id && t.inc_id == inc_id)
+        .map(|t| (t.node_id, t.timer_type.clone()))
+        .collect();
+    ctx.scene.remove_bt_timers_for_owner(lp_id);
+    for (node_id, timer_type) in ended {
+        push_lp_timer_end(ctx, lp_id, node_id, &timer_type);
+    }
+}
+
+/// Evaluates a running QuestFailed monitor. A FailedCondition.Timer it arms goes to the client.
+fn eval_lp_quest_failed<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    node: &NodeEntry,
+    player_pos_opt: Option<[f32; 3]>,
+    push_updates: bool,
+) -> io::Result<Option<FailReason>> {
+    let had_timer = ctx.scene.lp_fail_timers.contains(lp_id, node.id);
+    let mut lp_fail_timers = std::mem::take(&mut ctx.scene.lp_fail_timers);
+    let res = {
+        let mut qctx = ctx.as_quest_ctx();
+        quest_engine::eval_quest_failed_condition_pub(
+            &mut qctx,
+            lp_id,
+            node,
+            player_pos_opt,
+            &mut lp_fail_timers,
+        )
+    };
+    ctx.scene.lp_fail_timers = lp_fail_timers;
+    let reason = res?;
+    if reason.is_none()
+        && !had_timer
+        && let Some(due_ms) = ctx.scene.lp_fail_timers.get_due_ms(lp_id, node.id)
+    {
+        start_lp_node_timer(ctx, lp_id, node, due_ms, push_updates);
+    }
+    Ok(reason)
 }
 
 fn resolve_level_play_anchor_pos<S: PushSink + ?Sized>(
@@ -822,7 +1000,9 @@ fn push_level_play_behavior_tree_info<S: PushSink + ?Sized>(
     let mut timer_infos = Vec::new();
     for node in nodes {
         let finished = is_level_play_node_marked(ctx.progress_comp.as_deref(), lp_id, node.id);
-        let active = !finished && is_lp_node_active(ctx.progress_comp.as_deref(), lp_id, node.id);
+        let active = !finished
+            && (is_lp_node_active(ctx.progress_comp.as_deref(), lp_id, node.id)
+                || ctx.scene.lp_active_logic_nodes.contains(&(lp_id, node.id)));
         if !finished && !active {
             continue;
         }
@@ -863,6 +1043,13 @@ fn push_level_play_behavior_tree_info<S: PushSink + ?Sized>(
             },
         );
     }
+    timer_infos.extend(
+        ctx.scene
+            .bt_timers
+            .iter()
+            .filter(|t| t.owner_id == lp_id && t.inc_id == i64::from(lp_id))
+            .map(|t| t.to_proto()),
+    );
 
     ctx.sink.push(
         BehaviorTreeInfoNotify::MSG_ID,
@@ -952,6 +1139,7 @@ fn deactivate_lp_subtree<S: PushSink + ?Sized>(
         }
         ctx.scene.lp_timers.cancel(lp_id, n.id);
         ctx.scene.lp_fail_timers.cancel(lp_id, n.id);
+        end_lp_node_timer(ctx, lp_id, n, push_updates);
         ctx.scene.release_occupations_for_node(lp_id, n.id);
         let was_active = is_lp_node_active(ctx.progress_comp.as_deref(), lp_id, n.id);
         set_lp_node_active(ctx, lp_id, n.id, false, dirty_pc);
@@ -999,6 +1187,7 @@ fn complete_lp_child_quest<S: PushSink + ?Sized>(
     deferred_bt_vars: Option<&mut Vec<DeferredBtVar>>,
 ) -> io::Result<()> {
     ctx.scene.lp_timers.cancel(lp_id, node.id);
+    end_lp_node_timer(ctx, lp_id, node, push_updates);
     if is_level_play_node_marked(ctx.progress_comp.as_deref(), lp_id, node.id) {
         return Ok(());
     }
@@ -1076,6 +1265,7 @@ fn step_level_play_node<S: PushSink + ?Sized>(
 
     match node.node_type.as_str() {
         "Sequence" => {
+            activate_lp_logic_node(ctx, lp_id, node, push_updates);
             for child in nodes {
                 if child.parent_id != node.id {
                     continue;
@@ -1162,6 +1352,7 @@ fn step_level_play_node<S: PushSink + ?Sized>(
             Ok(LpStepResult::Completed)
         }
         "Parallel" | "ParallelSelect" => {
+            activate_lp_logic_node(ctx, lp_id, node, push_updates);
             let is_parallel_all = node.node_type == "Parallel";
             let eligible_children = nodes
                 .iter()
@@ -1320,21 +1511,8 @@ fn step_level_play_node<S: PushSink + ?Sized>(
         }
         "QuestFailed" => {
             // QuestFailed monitor node checks active failure conditions
-            let fail_reason = {
-                let mut lp_fail_timers = std::mem::take(&mut ctx.scene.lp_fail_timers);
-                let res = {
-                    let mut qctx = ctx.as_quest_ctx();
-                    quest_engine::eval_quest_failed_condition_pub(
-                        &mut qctx,
-                        lp_id,
-                        node,
-                        player_pos_opt,
-                        &mut lp_fail_timers,
-                    )
-                };
-                ctx.scene.lp_fail_timers = lp_fail_timers;
-                res?
-            };
+            activate_lp_logic_node(ctx, lp_id, node, push_updates);
+            let fail_reason = eval_lp_quest_failed(ctx, lp_id, node, player_pos_opt, push_updates)?;
             if let Some(reason) = fail_reason {
                 let fa = node.data.get("FinishActions");
                 run_level_play_actions(ctx, lp_id, node.id, fa, deferred_bt_vars.as_deref_mut());
@@ -1646,6 +1824,10 @@ fn step_level_play_node<S: PushSink + ?Sized>(
                         None,
                     );
                 }
+                if let Some(due_ms) = ctx.scene.lp_timers.get_due_ms(lp_id, node.id) {
+                    let push = push_updates && !defer_bt_notifies;
+                    start_lp_node_timer(ctx, lp_id, node, due_ms, push);
+                }
             }
             Ok(LpStepResult::Running)
         }
@@ -1951,6 +2133,10 @@ pub fn complete_level_play<S: PushSink + ?Sized>(
     ctx.scene.lp_timers.cancel_quest(level_play_id);
     ctx.scene.fail_timers.cancel_quest(level_play_id);
     ctx.scene.lp_fail_timers.cancel_quest(level_play_id);
+    end_lp_timers(ctx, level_play_id);
+    ctx.scene
+        .lp_active_logic_nodes
+        .retain(|&(lp, _)| lp != level_play_id);
     ctx.scene
         .release_occupations_for_tree(level_play_id, i64::from(level_play_id));
     ctx.scene.clear_save_nodes_for_owner(level_play_id);
@@ -3225,21 +3411,8 @@ pub fn on_player_move<S: PushSink + ?Sized>(
                 if !is_lp_failed_monitor_active(ctx.progress_comp.as_deref(), lp_id, &nodes, node) {
                     continue;
                 }
-                let fail_reason = {
-                    let mut lp_fail_timers = std::mem::take(&mut ctx.scene.lp_fail_timers);
-                    let res = {
-                        let mut qctx = ctx.as_quest_ctx();
-                        quest_engine::eval_quest_failed_condition_pub(
-                            &mut qctx,
-                            lp_id,
-                            node,
-                            Some(player_pos),
-                            &mut lp_fail_timers,
-                        )
-                    };
-                    ctx.scene.lp_fail_timers = lp_fail_timers;
-                    res?
-                };
+                activate_lp_logic_node(ctx, lp_id, node, true);
+                let fail_reason = eval_lp_quest_failed(ctx, lp_id, node, Some(player_pos), true)?;
                 if let Some(reason) = fail_reason {
                     let fa = node.data.get("FinishActions");
                     run_level_play_actions(ctx, lp_id, node.id, fa, None);
@@ -3280,6 +3453,10 @@ pub fn on_level_play_enabled<S: PushSink + ?Sized>(
         ctx.scene.lp_timers.cancel_quest(level_play_id);
         ctx.scene.fail_timers.cancel_quest(level_play_id);
         ctx.scene.lp_fail_timers.cancel_quest(level_play_id);
+        end_lp_timers(ctx, level_play_id);
+        ctx.scene
+            .lp_active_logic_nodes
+            .retain(|&(lp, _)| lp != level_play_id);
         ctx.scene
             .release_occupations_for_tree(level_play_id, i64::from(level_play_id));
         ctx.scene.clear_save_nodes_for_owner(level_play_id);
@@ -3538,9 +3715,13 @@ pub fn step_entered_tree_by_id<S: PushSink + ?Sized>(
     Ok(())
 }
 
+/// TimerEndRequest {TimerType}: a client CountDownTimer ran out (CountDownTimer.OnTick ->
+/// RequestTimerEnd). A Timer ChildQuest of another TimerType keeps running: the request also
+/// comes for the CountDownChallenge of a QuestFailed monitor, which is lp_fail_timers' job.
 pub fn on_bt_timer_end<S: PushSink + ?Sized>(
     ctx: &mut LevelPlayContext<'_, S>,
     lp_id: i32,
+    timer_type: &str,
 ) -> io::Result<bool> {
     if ctx.quest_comp.info.completed_level_plays.contains(&lp_id) {
         return Ok(false);
@@ -3561,6 +3742,12 @@ pub fn on_bt_timer_end<S: PushSink + ?Sized>(
             continue;
         };
         let ctype = json_str(cond.get("Type")).unwrap_or("");
+        if let Some(node_timer) = lp_node_timer_type(node)
+            && !timer_type.is_empty()
+            && node_timer != timer_type
+        {
+            continue;
+        }
         if ctype == "Timer" || ctype == "WaitTime" {
             complete_lp_child_quest(ctx, lp_id, node, true, &mut dirty_pc, None)?;
             progressed = true;
@@ -3683,6 +3870,7 @@ fn bt_rollback<S: PushSink + ?Sized>(
     }
     ctx.scene.lp_timers.cancel_quest(lp_id);
     ctx.scene.lp_fail_timers.cancel_quest(lp_id);
+    end_lp_timers(ctx, lp_id);
     ctx.scene
         .release_occupations_for_tree(lp_id, i64::from(lp_id));
 
