@@ -1725,47 +1725,76 @@ fn remove_evicted_entities<S: PushSink + ?Sized>(
     }
 }
 
+/// Client `IComponentDefine.AoiXyLayerValues`, keyed by BaseInfoComponent.AoiLayer
+/// (Aki.TdInterface.dll, `IComponentDefine..cctor`). No BinData or assets.db table has them.
+const AOI_XY_LAYER_VALUES: [(i32, f32); 8] = [
+    (0, 6000.0),
+    (1, 24000.0),
+    (2, 99000.0),
+    (3, 11000.0),
+    (6, 3000.0),
+    (7, 9000.0),
+    (8, 14000.0),
+    (9, 49000.0),
+];
+/// Client `IComponentDefine.AoizLayerValues`, keyed by BaseInfoComponent.AoiZRadius (same
+/// source); -1 means no Z limit.
+const AOI_Z_LAYER_VALUES: [(i32, f32); 5] = [
+    (0, -1.0),
+    (1, 24000.0),
+    (2, 6000.0),
+    (3, 3000.0),
+    (4, 50000.0),
+];
+
+/// Value of an AOI layer key; a missing or unknown key uses the Default (0) entry.
+fn aoi_layer_value(table: &[(i32, f32)], key: Option<i32>) -> f32 {
+    let key = key.unwrap_or(0);
+    table
+        .iter()
+        .find(|e| e.0 == key)
+        .or_else(|| table.first())
+        .map_or(0.0, |e| e.1)
+}
+
+/// A level entity's client AOI radii: (XY, Z), from its own BaseInfoComponent or its template's.
+/// Z is `None` when the client has no Z limit.
+fn client_aoi_radii(assets: &Assets, cfg: &LevelEntityConfig) -> (f32, Option<f32>) {
+    let own_info = cfg.ComponentsData.BaseInfoComponent.as_ref();
+    let mut layer = own_info.and_then(|bi| bi.AoiLayer);
+    let mut z_layer = own_info.and_then(|bi| bi.AoiZRadius);
+    if (layer.is_none() || z_layer.is_none())
+        && let Some(tpl) = assets.find_template_config(&cfg.BlueprintType)
+        && let Some(tpl_info) = tpl.ComponentsData.BaseInfoComponent.as_ref()
+    {
+        layer = layer.or(tpl_info.AoiLayer);
+        z_layer = z_layer.or(tpl_info.AoiZRadius);
+    }
+    let z = aoi_layer_value(&AOI_Z_LAYER_VALUES, z_layer);
+    (
+        aoi_layer_value(&AOI_XY_LAYER_VALUES, layer),
+        (z >= 0.0).then_some(z),
+    )
+}
+
+/// The Z half of the client's AOI test: no limit, or |dz| below it.
+fn within_client_aoi_z(z_radius: Option<f32>, dz: f32) -> bool {
+    z_radius.is_none_or(|z| dz.abs() < z)
+}
+
 /// Whether a level entity at `pos` is in the player's AOI the way the client computes it
-/// (`FlowActionUtils.CheckEntityInAoi`): 2D distance below `AoiXyLayerValues[AoiLayer]` and,
-/// unless `AoizLayerValues[AoiZRadius]` is -1, Z distance below that value. The tables come from
-/// the client's `IComponentDefine` static constructor (Aki.TdInterface).
+/// (`FlowActionUtils.CheckEntityInAoi`): 2D distance below the XY value and, unless the Z value
+/// is -1, Z distance below it.
 fn in_client_aoi(
     assets: &Assets,
     cfg: &LevelEntityConfig,
     pos: [f32; 3],
     player_loc: [f32; 3],
 ) -> bool {
-    let tpl = assets.find_template_config(&cfg.BlueprintType);
-    let tpl_info = tpl
-        .as_ref()
-        .and_then(|t| t.ComponentsData.BaseInfoComponent.as_ref());
-    let own_info = cfg.ComponentsData.BaseInfoComponent.as_ref();
-    let layer = own_info
-        .and_then(|bi| bi.AoiLayer)
-        .or_else(|| tpl_info.and_then(|bi| bi.AoiLayer));
-    let z_layer = own_info
-        .and_then(|bi| bi.AoiZRadius)
-        .or_else(|| tpl_info.and_then(|bi| bi.AoiZRadius));
-    let xy: f32 = match layer.unwrap_or(0) {
-        1 => 24000.0,
-        2 => 99000.0,
-        3 => 11000.0,
-        6 => 3000.0,
-        7 => 9000.0,
-        8 => 14000.0,
-        9 => 49000.0,
-        _ => 6000.0,
-    };
-    let z: Option<f32> = match z_layer.unwrap_or(0) {
-        1 => Some(24000.0),
-        2 => Some(6000.0),
-        3 => Some(3000.0),
-        4 => Some(50000.0),
-        _ => None,
-    };
+    let (xy, z) = client_aoi_radii(assets, cfg);
     let dx = pos[0] - player_loc[0];
     let dy = pos[1] - player_loc[1];
-    dx * dx + dy * dy < xy * xy && z.is_none_or(|z| (pos[2] - player_loc[2]).abs() < z)
+    dx * dx + dy * dy < xy * xy && within_client_aoi_z(z, pos[2] - player_loc[2])
 }
 
 /// Full scene: in spawn order, a candidate inside its client AOI takes the slot of an evictable
@@ -1988,13 +2017,7 @@ fn consider_spawn_candidates(
             cfg_id32 > 0 && quest_info.world.shown_entities.contains(&cfg_id32);
         if !is_quest_target
             && !explicitly_shown
-            && let Some(az) = cfg
-                .ComponentsData
-                .BaseInfoComponent
-                .as_ref()
-                .and_then(|bi| bi.AoiZRadius)
-            && az > 0
-            && dz.abs() > (az as f32)
+            && !within_client_aoi_z(client_aoi_radii(assets, &cfg).1, dz)
         {
             continue;
         }

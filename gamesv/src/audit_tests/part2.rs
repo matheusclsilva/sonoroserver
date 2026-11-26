@@ -6940,3 +6940,45 @@ fn audit_136_full_scene_evicts_out_of_aoi_entities_for_nearer_spawns() {
     }
 }
 
+
+#[test]
+fn audit_137_spawn_z_check_uses_client_aoiz_layer_values() {
+    use sonoro_gamesv_data::asset_indexes::entity_world_pos;
+
+    // Collect105 102001025 (map 8) has its own BaseInfoComponent.AoiZRadius 3, which is 3000 in
+    // the client's IComponentDefine.AoizLayerValues, not 3 units.
+    const COLLECT: i32 = 102_001_025;
+    fn spawned_with_player_dz(dz: f32) -> bool {
+        let mut h = TestHarness::new("audit137", Some(8));
+        let mut events = EventQueue::new();
+        let assets = Arc::clone(&h.state.assets);
+        let cfg = assets.find_level_entity(8, i64::from(COLLECT)).expect("102001025");
+        assert_eq!(
+            cfg.ComponentsData.BaseInfoComponent.as_ref().and_then(|bi| bi.AoiZRadius),
+            Some(3)
+        );
+        let p = entity_world_pos(&cfg).expect("pos");
+        h.state.scene.as_mut().unwrap().instance.players = vec![ScenePlayer {
+            id: h.state.player_id,
+            group_type: 1,
+            location: [p[0], p[1], p[2] + dz],
+            rotation: [0.0; 3],
+        }];
+        events.enqueue(Event::SpatialSpawnsCheck {
+            player_id: h.state.player_id,
+        });
+        while let Some(ev) = events.dequeue() {
+            let mut rt = h.state.as_runtime(&mut events, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+        }
+        h.state
+            .scene
+            .as_ref()
+            .unwrap()
+            .find_entity_net_id_by_config_id(COLLECT)
+            .is_some()
+    }
+
+    assert!(spawned_with_player_dz(500.0), "500 units away in Z, inside the 3000 Z radius");
+    assert!(!spawned_with_player_dz(3500.0), "outside the 3000 Z radius");
+}
