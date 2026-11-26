@@ -1336,27 +1336,13 @@ fn step_level_play_node<S: PushSink + ?Sized>(
                 res?
             };
             if let Some(reason) = fail_reason {
-                if let Some(fa) = node.data.get("FinishActions") {
-                    if push_updates && let Some(acts) = fa.as_array() {
-                        let mut qctx = ctx.as_quest_ctx();
-                        let _ = quest_engine::push_bt_level_events_for_type(
-                            &mut qctx,
-                            BtType::BtTypeLevelPlay,
-                            lp_id,
-                            node.id,
-                            GameCtxType::FailedNodeAction,
-                            acts,
-                        );
-                    }
-                    run_level_play_actions(
-                        ctx,
-                        lp_id,
-                        node.id,
-                        Some(fa),
-                        deferred_bt_vars.as_deref_mut(),
-                    );
-                }
-                on_bt_rollback(ctx, lp_id, node.id, reason)?;
+                let fa = node.data.get("FinishActions");
+                run_level_play_actions(ctx, lp_id, node.id, fa, deferred_bt_vars.as_deref_mut());
+                let client_acts: &[Value] = match fa {
+                    Some(Value::Array(acts)) if push_updates => acts.as_slice(),
+                    _ => &[],
+                };
+                on_quest_failed_rollback(ctx, lp_id, node.id, reason, client_acts)?;
                 return Ok(LpStepResult::TreeEnded);
             }
             Ok(LpStepResult::Running)
@@ -3255,21 +3241,13 @@ pub fn on_player_move<S: PushSink + ?Sized>(
                     res?
                 };
                 if let Some(reason) = fail_reason {
-                    if let Some(fa) = node.data.get("FinishActions") {
-                        if let Some(acts) = fa.as_array() {
-                            let mut qctx = ctx.as_quest_ctx();
-                            let _ = quest_engine::push_bt_level_events_for_type(
-                                &mut qctx,
-                                BtType::BtTypeLevelPlay,
-                                lp_id,
-                                node.id,
-                                GameCtxType::FailedNodeAction,
-                                acts,
-                            );
-                        }
-                        run_level_play_actions(ctx, lp_id, node.id, Some(fa), None);
-                    }
-                    on_bt_rollback(ctx, lp_id, node.id, reason)?;
+                    let fa = node.data.get("FinishActions");
+                    run_level_play_actions(ctx, lp_id, node.id, fa, None);
+                    let client_acts: &[Value] = match fa {
+                        Some(Value::Array(acts)) => acts.as_slice(),
+                        _ => &[],
+                    };
+                    on_quest_failed_rollback(ctx, lp_id, node.id, reason, client_acts)?;
                     break;
                 }
             }
@@ -3651,12 +3629,54 @@ pub fn on_bt_rollback<S: PushSink + ?Sized>(
     on_bt_rollback_with_select(ctx, lp_id, fail_node_id, reason, 2)
 }
 
+/// `on_bt_rollback` for a `QuestFailed` node that fired. `failed_actions` (its FinishActions)
+/// go to the client as FailedNodeAction right after BtRollbackNotify, as in
+/// `rollback_quest_to_node`: on BtRollbackNotify the client's PrepareRollback stops the tree's
+/// running action sessions, so a run sent before it could be cut after its first action.
+fn on_quest_failed_rollback<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    fail_node_id: i32,
+    reason: FailReason,
+    failed_actions: &[Value],
+) -> io::Result<()> {
+    bt_rollback(ctx, lp_id, fail_node_id, reason, 2, failed_actions)
+}
+
 pub fn on_bt_rollback_with_select<S: PushSink + ?Sized>(
     ctx: &mut LevelPlayContext<'_, S>,
     lp_id: i32,
     fail_node_id: i32,
     reason: FailReason,
     select: i32,
+) -> io::Result<()> {
+    bt_rollback(ctx, lp_id, fail_node_id, reason, select, &[])
+}
+
+fn push_failed_node_actions<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    fail_node_id: i32,
+    failed_actions: &[Value],
+) {
+    let mut qctx = ctx.as_quest_ctx();
+    let _ = quest_engine::push_bt_level_events_for_type(
+        &mut qctx,
+        BtType::BtTypeLevelPlay,
+        lp_id,
+        fail_node_id,
+        GameCtxType::FailedNodeAction,
+        failed_actions,
+    );
+}
+
+fn bt_rollback<S: PushSink + ?Sized>(
+    ctx: &mut LevelPlayContext<'_, S>,
+    lp_id: i32,
+    fail_node_id: i32,
+    reason: FailReason,
+    select: i32,
+    failed_actions: &[Value],
 ) -> io::Result<()> {
     if lp_id <= 0 || ctx.quest_comp.info.completed_level_plays.contains(&lp_id) {
         return Ok(());
@@ -3681,6 +3701,7 @@ pub fn on_bt_rollback_with_select<S: PushSink + ?Sized>(
         }
     }
     if latest_ckpt_id == 0 && reason != FailReason::DefaultFail {
+        push_failed_node_actions(ctx, lp_id, fail_node_id, failed_actions);
         on_level_play_enabled(ctx, lp_id, false)?;
         return Ok(());
     }
@@ -3725,6 +3746,7 @@ pub fn on_bt_rollback_with_select<S: PushSink + ?Sized>(
             FailNodeId: fail_node_id,
         },
     );
+    push_failed_node_actions(ctx, lp_id, fail_node_id, failed_actions);
 
     if !nodes.is_empty() {
         step_level_play_tree(ctx, lp_id, &nodes, true, current_player_pos(ctx))?;

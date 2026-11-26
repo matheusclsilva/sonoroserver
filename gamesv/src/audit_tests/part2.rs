@@ -5884,6 +5884,77 @@ fn audit_126_quest_failed_finish_actions_push_failed_node_action() {
     let rollback = frames.iter().position(|f| f.0 == BtRollbackNotify::MSG_ID).unwrap();
     let rebuild = frames.iter().position(|f| f.0 == BtRollbackInfoNotify::MSG_ID).unwrap();
     assert!(rollback < pos && pos < rebuild, "order {rollback} < {pos} < {rebuild}");
+
+    // (iii) LevelPlay 102800000 (map 8): 1 Sequence > 191 Sequence > [197 Sequence SaveConfig,
+    // 198 Sequence SaveConfig > 262 ParallelSelect > [261, 363 QuestFailed, 408 QuestFailed
+    // {RangeLimiting 6500, EntityStateCondition 102800071 激活}]]; 408 FinishActions
+    // [FadeInScreen, SetPlayerPos, ChangeEntityState, SetVar], so the client gets 0..0 and 2..2.
+    // With 197 finished, a fail of 408 rolls back to checkpoint 197 and sends BtRollbackNotify,
+    // so both runs must come right after it. The level-play rollback rebuilds the tree by
+    // stepping it (no BtRollbackInfoNotify). Fired once by the tree step, once by a move.
+    const FLOAT_LP: i32 = 102_800_000;
+    const FLOAT_POS: [f32; 3] = [73_908.78, -83_757.9, 8_019.6];
+    let mut h = TestHarness::new("audit126c", Some(8));
+    let mut events = EventQueue::new();
+    let lp_nodes = h.state.assets.level_play_nodes.get_owner_nodes(FLOAT_LP).expect("lp nodes");
+    let fail_node = lp_nodes.iter().find(|n| n.id == 408).unwrap().clone();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::on_level_play_enabled(&mut lctx, FLOAT_LP, true).expect("enable lp");
+    }
+    for by_move in [false, true] {
+        h.state.player_components.progress.info.set_key_int("lp_node:102800000:197", 1);
+        {
+            let mut qctx = h.state.quest_context(&mut events);
+            let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+            level_play::step_entered_tree_by_id(&mut lctx, FLOAT_LP).expect("step to 198");
+        }
+        assert!(level_play::is_lp_failed_monitor_active(
+            Some(&h.state.player_components.progress),
+            FLOAT_LP,
+            &lp_nodes,
+            &fail_node
+        ));
+        h.state
+            .player_components
+            .quest
+            .info
+            .set_entity_state(102_800_071, "关卡.Common.状态.激活");
+        let _ = h.drain_count();
+        {
+            let mut qctx = h.state.quest_context(&mut events);
+            let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+            if by_move {
+                let [x, y, z] = FLOAT_POS;
+                level_play::on_player_move(&mut lctx, x, y, z).expect("lp move");
+            } else {
+                level_play::step_entered_tree_by_id(&mut lctx, FLOAT_LP).expect("step 408");
+            }
+        }
+        let frames = drain_push_frames(&mut h);
+        let rollback = frames
+            .iter()
+            .position(|f| f.0 == BtRollbackNotify::MSG_ID)
+            .expect("BtRollbackNotify");
+        let failed: Vec<_> = bt_action_notifies(&frames)
+            .into_iter()
+            .filter(|a| a.1 == GameCtxType::FailedNodeAction && a.3 == FLOAT_LP)
+            .map(|(i, _, bt, id, nid, s, e, total)| (i, bt, id, nid, s, e, total))
+            .collect();
+        let lp = Some(BtType::BtTypeLevelPlay);
+        assert_eq!(
+            failed,
+            vec![
+                (rollback + 1, lp, FLOAT_LP, 408, 0, 0, 4),
+                (rollback + 2, lp, FLOAT_LP, 408, 2, 2, 4)
+            ],
+            "by_move={by_move}: FailedNodeAction must follow BtRollbackNotify"
+        );
+        assert!(
+            h.state.player_components.quest.info.progress.entered_level_plays.contains(&FLOAT_LP)
+        );
+    }
 }
 
 #[test]
