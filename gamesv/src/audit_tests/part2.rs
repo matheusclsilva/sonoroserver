@@ -6814,3 +6814,129 @@ fn audit_135_condition_listener_actions_push_entity_condition_listening_action()
     let frames = listen(&mut h, &mut events, 10);
     assert_eq!(indexes(&frames, nid), vec![(0, (0, 0, 1))]);
 }
+
+#[test]
+fn audit_136_full_scene_evicts_out_of_aoi_entities_for_nearer_spawns() {
+    use sonoro_gamesv_data::asset_indexes::entity_world_pos;
+    use sonoro_proto::enums::ERemoveEntityType;
+    use sonoro_proto::pb::EntityRemoveNotify;
+    use sonoro_proto::wire::PbMessage;
+
+    // Teleport001 109002092 (Teleporter 300304, map 8) never spawned once the Jinzhou scene held
+    // 240 entities (docs map P0-2). Teleport001's template has AoiLayer 1: 24000 in the client's
+    // IComponentDefine.AoiXyLayerValues.
+    const BEACON: i32 = 109_002_092;
+    fn place(h: &mut TestHarness, cfg_id: i32, location: [f32; 3]) -> i64 {
+        let nid = spawn_level_entity(h, cfg_id, EntityType::SceneItem);
+        let sc = h.state.scene.as_mut().unwrap();
+        sc.entity_mut(nid).unwrap().position.as_mut().unwrap().location = location;
+        nid
+    }
+
+    let mut h = TestHarness::new("audit136", Some(8));
+    let mut events = EventQueue::new();
+    let assets = Arc::clone(&h.state.assets);
+    let beacon = assets.find_level_entity(8, i64::from(BEACON)).expect("beacon 109002092");
+    let b = entity_world_pos(&beacon).expect("beacon pos");
+    let player = [b[0] + 360.0, b[1], b[2]];
+    let dist = |p: [f32; 3]| {
+        ((p[0] - player[0]).powi(2) + (p[1] - player[1]).powi(2) + (p[2] - player[2]).powi(2)).sqrt()
+    };
+
+    // Fill to the cap: two other Teleport001 beacons, one 50 m away (inside its 240 m AOI) and one
+    // 250 m away (outside it), and level entities 120-190 m away whose AoiLayer 0/6/7 (60/30/90 m)
+    // puts them outside the client AOI. The old eviction (non-priority past 210-240 m, any past
+    // 320 m) keeps all of them.
+    let mut teleports = Vec::new();
+    let mut ring = Vec::new();
+    for &idx in assets.indexes.spawnable_indices_for_map(8) {
+        let Some(cfg) = assets.get_level_entity_by_idx(idx) else {
+            continue;
+        };
+        let Ok(id) = i32::try_from(cfg.EntityId) else {
+            continue;
+        };
+        let own_layer = cfg.ComponentsData.BaseInfoComponent.as_ref().and_then(|bi| bi.AoiLayer);
+        if id == BEACON {
+            continue;
+        }
+        if cfg.BlueprintType == "Teleport001" && own_layer.is_none() {
+            teleports.push(id);
+            continue;
+        }
+        let Some(pos) = entity_world_pos(&cfg) else {
+            continue;
+        };
+        let layer = own_layer
+            .or_else(|| {
+                assets
+                    .find_template_config(&cfg.BlueprintType)
+                    .and_then(|t| t.ComponentsData.BaseInfoComponent.as_ref().and_then(|bi| bi.AoiLayer))
+            })
+            .unwrap_or(0);
+        if matches!(layer, 0 | 6 | 7) && (12_000.0..19_000.0).contains(&dist(pos)) {
+            ring.push((id, pos));
+        }
+    }
+    assert!(teleports.len() >= 2 && ring.len() >= 238, "map 8 fill data");
+    let near_tp = place(&mut h, teleports[0], [player[0] + 5_000.0, player[1], player[2]]);
+    let far_tp = place(&mut h, teleports[1], [player[0] + 25_000.0, player[1], player[2]]);
+    let ring_ids: Vec<i64> = ring.iter().take(238).map(|&(id, pos)| place(&mut h, id, pos)).collect();
+    // A ring entity with a saved entity state is never evicted.
+    let saved = ring_ids[0];
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(i64::from(ring[0].0), "关卡.Common.状态.激活");
+    {
+        let sc = h.state.scene.as_mut().unwrap();
+        assert_eq!(sc.entities.len(), 240);
+        sc.instance.players = vec![ScenePlayer {
+            id: h.state.player_id,
+            group_type: 1,
+            location: player,
+            rotation: [0.0; 3],
+        }];
+    }
+    let _ = h.drain_count();
+
+    // The move also enters the level plays around the beacon, whose entities push the scene
+    // past the cap before the spawner runs.
+    events.enqueue(Event::SpatialSpawnsCheck {
+        player_id: h.state.player_id,
+    });
+    while let Some(ev) = events.dequeue() {
+        let mut rt = h.state.as_runtime(&mut events, None);
+        sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+    }
+    let frames = drain_push_frames(&mut h);
+
+    let sc = h.state.scene.as_ref().unwrap();
+    let beacon_nid = sc
+        .find_entity_net_id_by_config_id(BEACON)
+        .expect("beacon 109002092 spawned 3.6 m from the player");
+    assert!(sc.entities.len() <= 240, "cap kept: {}", sc.entities.len());
+    let added: Vec<i64> = frames
+        .iter()
+        .filter(|(id, _)| *id == EntityAddNotify::MSG_ID)
+        .flat_map(|(_, p)| EntityAddNotify::decode(p).unwrap().EntityPbs)
+        .map(|e| e.Id)
+        .collect();
+    assert!(added.contains(&beacon_nid));
+    let removed: Vec<(i64, Option<ERemoveEntityType>)> = frames
+        .iter()
+        .filter(|(id, _)| *id == EntityRemoveNotify::MSG_ID)
+        .flat_map(|(_, p)| EntityRemoveNotify::decode(p).unwrap().RemoveInfos)
+        .map(|r| (r.EntityId, r.Type))
+        .collect();
+    assert!(!removed.is_empty());
+    assert!(removed.iter().all(|r| r.1 == Some(ERemoveEntityType::RemoveTypeNormal)));
+    assert!(removed.iter().all(|r| r.0 == far_tp || ring_ids.contains(&r.0)));
+    assert!(removed.iter().any(|r| r.0 == far_tp), "beacon 250 m away is outside its AOI");
+    for kept in [near_tp, saved] {
+        assert!(!removed.iter().any(|r| r.0 == kept), "{kept} evicted");
+        assert!(sc.net_id_map.contains_key(&kept));
+    }
+}
+
