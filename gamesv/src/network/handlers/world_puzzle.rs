@@ -1208,29 +1208,37 @@ pub fn handle_elevator_state_change_request(
         .and_then(|idx| state.scene.as_ref()?.entities[idx].world_item.lift)
         .map(|l| l.location)
         .unwrap_or(0);
+    // The client never sets 关卡.电梯.* itself; it only reports Forward (moving up),
+    // Reverse (moving down) and End (arrived), so the server owns the entity state.
+    let elevator_state_name = match req.State {
+        Some(sonoro_proto::enums::ElevatorState::End) => Some("关卡.电梯.停靠"),
+        Some(sonoro_proto::enums::ElevatorState::Forward) => Some("关卡.电梯.上升"),
+        Some(sonoro_proto::enums::ElevatorState::Reverse) => Some("关卡.电梯.下降"),
+        None => None,
+    };
     if let Some(scene) = state.scene.as_mut()
         && let Some(&idx) = scene.net_id_map.get(&req.EntityId)
     {
         scene.entities[idx].world_item.lift = Some(EntityLiftComponent {
             location: req.TagState,
         });
-        if req.State == Some(sonoro_proto::enums::ElevatorState::End) {
+        if let Some(state_name) = elevator_state_name {
             scene.update_entity_state_tag(
                 &state.assets.tables.gameplay_tag_remap,
                 req.EntityId,
-                "关卡.电梯.停靠",
+                state_name,
             );
         }
     }
     let info = &mut state.player_components.progress.info;
     info.set_key_int(&format!("elevator:{config_id}"), i64::from(req.TagState));
     info.set_key_int(&format!("lift_target:{config_id}"), i64::from(req.TagState));
-    if req.State == Some(sonoro_proto::enums::ElevatorState::End) {
+    if let Some(state_name) = elevator_state_name {
         state
             .player_components
             .quest
             .info
-            .set_entity_state(i64::from(config_id), "关卡.电梯.停靠");
+            .set_entity_state(i64::from(config_id), state_name);
         state
             .player_components
             .quest

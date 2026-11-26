@@ -5189,3 +5189,109 @@ fn audit_120_tune_break_elite_regen_and_active_flow_collectibles() {
     assert!(removes.iter().flat_map(|n| n.RemoveInfos.iter()).any(|ri| ri.EntityId == lizard_drop_nid));
     assert!(level_play::resolve_entity_config(&h.state.assets, 8, 136_001_965).is_some());
 }
+
+#[test]
+fn audit_121_elevator_forward_reverse_drive_rise_fall_entity_state() {
+    use sonoro_proto::enums::ElevatorState;
+    use sonoro_proto::pb::ElevatorStateChangeRequest;
+
+    // Quest 139000027 node 154 waits on
+    // {"Type":"CheckEntityState","Conditions":[{"EntityId":109002461,"State":"关卡.电梯.上升"}]}.
+    // The client never sets 关卡.电梯.* itself; it only reports ElevatorStateChangeRequest
+    // Forward (moving up) / Reverse (moving down) / End (arrived).
+    const LIFT_CFG: i32 = 109_002_461;
+    const QUEST_ID: i32 = 139_000_027;
+    const NODE_ID: i32 = 154;
+
+    fn send(h: &mut TestHarness, lift_nid: i64, st: ElevatorState, floor: i32) {
+        let resp = world_puzzle::handle_elevator_state_change_request(
+            &mut h.state,
+            ElevatorStateChangeRequest {
+                EntityId: lift_nid,
+                State: Some(st),
+                TagState: floor,
+            },
+        )
+        .expect("elevator state change");
+        assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    }
+    fn scene_state_tag(h: &TestHarness, lift_nid: i64) -> Option<i32> {
+        h.state
+            .scene
+            .as_ref()
+            .and_then(|sc| sc.entity(lift_nid))
+            .and_then(|e| e.state_tag)
+            .map(|st| st.state_tag_id)
+    }
+
+    let mut h = TestHarness::new("audit121", Some(8));
+    h.state
+        .player_components
+        .quest
+        .info
+        .get_or_add_active_quest(QUEST_ID)
+        .active_nodes
+        .push(NODE_ID);
+    let lift_nid = {
+        let mut st = EntityComponentStorage::new(
+            0,
+            ConfigComponent {
+                camp: 0,
+                config_id: LIFT_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::SceneItem,
+                state: EntityState::Default,
+            },
+        );
+        st.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        h.state.scene.as_mut().unwrap().spawn(st).net_id
+    };
+    let _ = h.drain_count();
+    let remaps = &h.state.assets.tables.gameplay_tag_remap;
+    let rise_tag = gameplay_tags::id_from_name(remaps, "关卡.电梯.上升");
+    let fall_tag = gameplay_tags::id_from_name(remaps, "关卡.电梯.下降");
+
+    // Docked (End) must not satisfy the 上升 wait.
+    send(&mut h, lift_nid, ElevatorState::End, 1);
+    let qinfo = &h.state.player_components.quest.info;
+    assert_eq!(
+        qinfo.get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.停靠")
+    );
+    assert!(!qinfo.has_finished_child_quest(QUEST_ID, NODE_ID));
+
+    // Forward (moving up) => 关卡.电梯.上升, and the CheckEntityState node completes.
+    send(&mut h, lift_nid, ElevatorState::Forward, 2);
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.上升")
+    );
+    assert_eq!(scene_state_tag(&h, lift_nid), rise_tag);
+    assert!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .has_finished_child_quest(QUEST_ID, NODE_ID),
+        "ElevatorState::Forward must satisfy CheckEntityState 关卡.电梯.上升 on quest {QUEST_ID} node {NODE_ID}"
+    );
+
+    // Reverse (moving down) => 关卡.电梯.下降.
+    send(&mut h, lift_nid, ElevatorState::Reverse, 1);
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.下降")
+    );
+    assert_eq!(scene_state_tag(&h, lift_nid), fall_tag);
+}
