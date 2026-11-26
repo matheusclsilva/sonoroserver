@@ -26,8 +26,8 @@ use sonoro_proto::pb::{
     ChildQuestNodeEnterActionCtxPb, ChildQuestNodeFinishActionCtxPb, ChildQuestNodeInfo,
     ChildQuestNodeProgress, ChildQuestNodeProgressProgressOneof, CompleteInstProgress,
     CompositionConditionEnterActionCtxPb, CompositionEnterActionCtxPb, DailyQuestStateNotify,
-    DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify, EntityCtxPb,
-    EntityAddNotify, EntityLeaveTriggerCtxPb, EntityRemoveDynamicInteractNotify,
+    DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify, EntityConditionListeningActionCtxPb,
+    EntityCtxPb, EntityAddNotify, EntityLeaveTriggerCtxPb, EntityRemoveDynamicInteractNotify,
     EntityRemoveInfo, EntityRemoveNotify, EntityTriggerCtxPb,
     EntityStateProgress, FailedNodeActionCtxPb, FightRoleInfo, FightRoleInfos, FlowStartNotify,
     FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
@@ -403,6 +403,22 @@ pub fn reevaluate_condition_listeners<S: PushSink + ?Sized>(
                 if already_fired {
                     continue;
                 }
+                // LevelGeneralNetworks.HandleEntityConditionListenerActionByServerNotify runs
+                // ConditionListenerComponent.Listeners[EntityConditionListeningIndex].Actions.
+                push_entity_level_events(
+                    ctx,
+                    GameCtxType::EntityConditionListeningAction,
+                    GameCtxPbCtxInfoOneof::EntityConditionListeningAction(
+                        EntityConditionListeningActionCtxPb {
+                            EntityCtx: Some(EntityCtxPb {
+                                ConfigId: cfg_id,
+                                IncId: net_id,
+                            }),
+                            EntityConditionListeningIndex: idx as i32,
+                        },
+                    ),
+                    acts,
+                );
                 execute_entity_actions(ctx, net_id, cfg_id, acts)?;
             } else if let Some(sc) = ctx.scene.as_deref_mut() {
                 sc.fired_condition_listeners.remove(&dedupe_key);

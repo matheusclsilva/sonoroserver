@@ -6740,3 +6740,47 @@ fn audit_134_trigger_actions_push_entity_trigger_and_leave_trigger() {
     );
     assert_ne!(sid, enter[0].5);
 }
+
+#[test]
+fn audit_135_condition_listener_actions_push_entity_condition_listening_action() {
+    // Gameplay097 152850092 (map 8) ConditionListenerComponent.Listeners: 0 {CompareTimePeriod
+    // DayTime} [ChangeEntityState 152850097 激活]; 1 {CompareTimePeriod Night}
+    // [ChangeEntityState 152850097 常态].
+    const CFG: i32 = 152_850_092;
+    fn listen(h: &mut TestHarness, events: &mut EventQueue, hour: i32) -> Vec<(u16, Vec<u8>)> {
+        let env = &mut h.state.player_components.quest.info.env;
+        env.time_locked = true;
+        env.time_lock_hour = hour;
+        env.time_lock_minute = 0;
+        {
+            let mut qctx = h.state.quest_context(events);
+            quest_engine::triggers::reevaluate_condition_listeners(&mut qctx).expect("listeners");
+        }
+        drain_push_frames(h)
+    }
+    fn indexes(frames: &[(u16, Vec<u8>)], nid: i64) -> Vec<(i64, (i32, i32, i32))> {
+        entity_action_notifies(frames)
+            .into_iter()
+            .inspect(|a| {
+                assert_eq!(
+                    (a.1, a.2),
+                    (GameCtxType::EntityConditionListeningAction, (CFG, nid))
+                )
+            })
+            .map(|a| (a.3, a.4))
+            .collect()
+    }
+
+    let mut h = TestHarness::new("audit135", Some(8));
+    let mut events = EventQueue::new();
+    let nid = spawn_level_entity(&mut h, CFG, EntityType::SceneItem);
+    let _ = h.drain_count();
+
+    let frames = listen(&mut h, &mut events, 22);
+    assert_eq!(indexes(&frames, nid), vec![(1, (0, 0, 1))]);
+    // Still night: the listener already fired.
+    let frames = listen(&mut h, &mut events, 23);
+    assert!(indexes(&frames, nid).is_empty());
+    let frames = listen(&mut h, &mut events, 10);
+    assert_eq!(indexes(&frames, nid), vec![(0, (0, 0, 1))]);
+}
