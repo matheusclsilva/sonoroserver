@@ -1210,11 +1210,12 @@ pub fn handle_elevator_state_change_request(
         .unwrap_or(0);
     // The client never sets 关卡.电梯.* itself; it only reports Forward (moving up),
     // Reverse (moving down) and End (arrived), so the server owns the entity state.
+    // `State` is a proto3 enum: the client omits the default `End` (0) on the wire, so a
+    // missing field means the lift arrived.
     let elevator_state_name = match req.State {
-        Some(sonoro_proto::enums::ElevatorState::End) => Some("关卡.电梯.停靠"),
         Some(sonoro_proto::enums::ElevatorState::Forward) => Some("关卡.电梯.上升"),
         Some(sonoro_proto::enums::ElevatorState::Reverse) => Some("关卡.电梯.下降"),
-        None => None,
+        Some(sonoro_proto::enums::ElevatorState::End) | None => Some("关卡.电梯.停靠"),
     };
     if let Some(scene) = state.scene.as_mut()
         && let Some(&idx) = scene.net_id_map.get(&req.EntityId)

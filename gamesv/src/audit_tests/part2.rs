@@ -5204,11 +5204,14 @@ fn audit_121_elevator_forward_reverse_drive_rise_fall_entity_state() {
     const NODE_ID: i32 = 154;
 
     fn send(h: &mut TestHarness, lift_nid: i64, st: ElevatorState, floor: i32) {
+        send_raw(h, lift_nid, Some(st), floor);
+    }
+    fn send_raw(h: &mut TestHarness, lift_nid: i64, st: Option<ElevatorState>, floor: i32) {
         let resp = world_puzzle::handle_elevator_state_change_request(
             &mut h.state,
             ElevatorStateChangeRequest {
                 EntityId: lift_nid,
-                State: Some(st),
+                State: st,
                 TagState: floor,
             },
         )
@@ -5294,4 +5297,16 @@ fn audit_121_elevator_forward_reverse_drive_rise_fall_entity_state() {
         Some("关卡.电梯.下降")
     );
     assert_eq!(scene_state_tag(&h, lift_nid), fall_tag);
+
+    // Arrival as sent by the client: proto3 omits the default End (0), so State is None.
+    send_raw(&mut h, lift_nid, None, 1);
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.停靠"),
+        "a missing State (wire default End) must dock the lift"
+    );
 }
