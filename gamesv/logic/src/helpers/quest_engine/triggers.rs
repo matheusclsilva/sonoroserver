@@ -27,7 +27,8 @@ use sonoro_proto::pb::{
     ChildQuestNodeProgress, ChildQuestNodeProgressProgressOneof, CompleteInstProgress,
     CompositionConditionEnterActionCtxPb, CompositionEnterActionCtxPb, DailyQuestStateNotify,
     DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify, EntityCtxPb,
-    EntityAddNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo, EntityRemoveNotify,
+    EntityAddNotify, EntityLeaveTriggerCtxPb, EntityRemoveDynamicInteractNotify,
+    EntityRemoveInfo, EntityRemoveNotify, EntityTriggerCtxPb,
     EntityStateProgress, FailedNodeActionCtxPb, FightRoleInfo, FightRoleInfos, FlowStartNotify,
     FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
     GroupFormation,
@@ -161,6 +162,7 @@ pub fn handle_entity_range_trigger<S: PushSink + ?Sized>(
                     ctx,
                     entity_id,
                     cfg_id,
+                    true,
                     &trig.Condition,
                     &trig.Actions,
                 )?
@@ -186,7 +188,7 @@ pub fn handle_entity_range_trigger<S: PushSink + ?Sized>(
         if was_in_range && let Value::Object(exit_obj) = &trig.ExitConfig {
             let exit_cond = exit_obj.get("Condition").unwrap_or(&Value::Null);
             let exit_acts = exit_obj.get("Actions").unwrap_or(&Value::Null);
-            let _ = execute_trigger_actions(ctx, entity_id, cfg_id, exit_cond, exit_acts)?;
+            let _ = execute_trigger_actions(ctx, entity_id, cfg_id, false, exit_cond, exit_acts)?;
         }
     }
     Ok(progress_dirty)
@@ -251,6 +253,7 @@ pub fn execute_trigger_actions<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     entity_id: i64,
     cfg_id: i32,
+    is_enter: bool,
     cond_val: &Value,
     actions_val: &Value,
 ) -> io::Result<bool> {
@@ -267,8 +270,44 @@ pub fn execute_trigger_actions<S: PushSink + ?Sized>(
             return Ok(false);
         }
     }
+    push_trigger_level_events(ctx, entity_id, cfg_id, is_enter, items);
     execute_entity_actions(ctx, entity_id, cfg_id, items)?;
     Ok(true)
+}
+
+/// Client side of `TriggerComponent.Actions` (EntityTrigger) and `ExitConfig.Actions`
+/// (EntityLeaveTrigger): SceneItemUtility.Handle(Exit)TriggerStateActionByServerNotify runs
+/// them with a TriggerContext of `TriggerEntityIncId`, the entity that crossed the range, here
+/// the player's current role.
+fn push_trigger_level_events<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    entity_id: i64,
+    cfg_id: i32,
+    is_enter: bool,
+    actions: &[Value],
+) {
+    let Some(entity_ctx) = scene_entity_ctx(ctx, entity_id, cfg_id) else {
+        return;
+    };
+    let role_id = ctx.scene.as_deref().map_or(0, Scene::current_role_entity_id);
+    let (ctx_type, ctx_info) = if is_enter {
+        (
+            GameCtxType::EntityTrigger,
+            GameCtxPbCtxInfoOneof::EntityTrigger(EntityTriggerCtxPb {
+                EntityCtx: Some(entity_ctx),
+                TriggerEntityIncId: role_id,
+            }),
+        )
+    } else {
+        (
+            GameCtxType::EntityLeaveTrigger,
+            GameCtxPbCtxInfoOneof::EntityLeaveTriggerCtx(EntityLeaveTriggerCtxPb {
+                EntityCtx: Some(entity_ctx),
+                TriggerEntityIncId: role_id,
+            }),
+        )
+    };
+    push_entity_level_events(ctx, ctx_type, ctx_info, actions);
 }
 
 pub fn handle_client_trigger_actions<S: PushSink + ?Sized>(

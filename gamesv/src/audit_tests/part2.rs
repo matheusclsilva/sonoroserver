@@ -6662,3 +6662,81 @@ fn audit_133_state_change_behaviors_push_entity_state_change_action() {
     let frames = change(&mut h, &mut events, "关卡.Common.状态.常态");
     assert!(entity_action_notifies(&frames).is_empty());
 }
+
+#[test]
+fn audit_134_trigger_actions_push_entity_trigger_and_leave_trigger() {
+    // Gameplay104 135000520 (map 8) TriggerComponent: Actions [SetSportsState Slide 3,
+    // AddBuffToPlayer]; ExitConfig.Actions [SetSportsState Slide 0, RemoveBuffFromPlayer,
+    // AddBuffToPlayer, CameraLookAt].
+    const CFG: i32 = 135_000_520;
+    fn access(
+        h: &mut TestHarness,
+        events: &mut EventQueue,
+        nid: i64,
+        ty: AccessRangeType,
+    ) -> Vec<(u16, Vec<u8>)> {
+        let _ = map::handle_player_access_range_request(
+            &mut h.state,
+            events,
+            PlayerAccessRangeRequest {
+                RangeEntityId: nid,
+                AccessRangeType: Some(ty),
+            },
+        )
+        .expect("access range");
+        drain_push_frames(h)
+    }
+
+    let mut h = TestHarness::new("audit134", Some(8));
+    let mut events = EventQueue::new();
+    let nid = spawn_level_entity(&mut h, CFG, EntityType::SceneItem);
+    let role = {
+        let sc = h.state.scene.as_mut().unwrap();
+        let storage = EntityComponentStorage::new(
+            110_201,
+            ConfigComponent {
+                camp: 1,
+                config_id: 1102,
+                config_type: ConfigType::Character,
+                entity_type: EntityType::Player,
+                state: EntityState::Default,
+            },
+        );
+        let role_nid = sc.spawn_with_net_id(110_201, storage).unwrap().net_id;
+        sc.formation_info.cur_formation = 0;
+        sc.formation_info.formations[0].cur_role = 1102;
+        sc.formation_info.formations[0].roles[0] = Some(FormationRole {
+            role_id: 1102,
+            entity_id: role_nid,
+            ..Default::default()
+        });
+        role_nid
+    };
+    assert_eq!(h.state.scene.as_ref().unwrap().current_role_entity_id(), role);
+    let _ = h.drain_count();
+
+    let frames = access(&mut h, &mut events, nid, AccessRangeType::RangeEnter);
+    let enter = entity_action_notifies(&frames);
+    assert_eq!(enter.len(), 1, "{enter:?}");
+    assert_eq!(
+        (enter[0].1, enter[0].2, enter[0].3, enter[0].4),
+        (GameCtxType::EntityTrigger, (CFG, nid), role, (0, 0, 2))
+    );
+
+    // Two client runs of one list share its session id.
+    let frames = access(&mut h, &mut events, nid, AccessRangeType::RangeLeave);
+    let leave: Vec<_> = entity_action_notifies(&frames)
+        .into_iter()
+        .map(|a| (a.1, a.2, a.3, a.4, a.5))
+        .collect();
+    let sid = leave.first().map_or(0, |a| a.4);
+    let ctx = (GameCtxType::EntityLeaveTrigger, (CFG, nid), role);
+    assert_eq!(
+        leave,
+        vec![
+            (ctx.0, ctx.1, ctx.2, (0, 0, 4), sid),
+            (ctx.0, ctx.1, ctx.2, (3, 3, 4), sid)
+        ]
+    );
+    assert_ne!(sid, enter[0].5);
+}
