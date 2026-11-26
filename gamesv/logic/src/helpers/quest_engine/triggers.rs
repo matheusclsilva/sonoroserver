@@ -27,8 +27,9 @@ use sonoro_proto::pb::{
     ChildQuestNodeProgress, ChildQuestNodeProgressProgressOneof, CompleteInstProgress,
     DailyQuestStateNotify, DailyQuestUnlockAreaNotify, EntityAddDynamicInteractNotify,
     EntityAddNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo, EntityRemoveNotify,
-    EntityStateProgress, FightRoleInfo, FightRoleInfos, FlowStartNotify, FocusQuestSetNotify,
-    GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress, GroupFormation,
+    EntityStateProgress, FailedNodeActionCtxPb, FightRoleInfo, FightRoleInfos, FlowStartNotify,
+    FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
+    GroupFormation,
     InteractProgress, KillProgress, LevelEventNotify, NodeInfo, NodeInfoExtraInfoOneof,
     QuestBranchUpdateNotify, QuestFinishListNotify, QuestInfo as PbQuestInfo,
     QuestListNotify, QuestReadyListNotify, QuestShowListNotify, SuccessNodeActionCtxPb,
@@ -1783,6 +1784,11 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
         }
         GameCtxType::SuccessNodeAction => {
             GameCtxPbCtxInfoOneof::SuccessNodeAction(SuccessNodeActionCtxPb {
+                BehaviorTreeCtx: Some(bt_ctx),
+            })
+        }
+        GameCtxType::FailedNodeAction => {
+            GameCtxPbCtxInfoOneof::FailedNodeAction(FailedNodeActionCtxPb {
                 BehaviorTreeCtx: Some(bt_ctx),
             })
         }

@@ -1337,6 +1337,17 @@ fn step_level_play_node<S: PushSink + ?Sized>(
             };
             if let Some(reason) = fail_reason {
                 if let Some(fa) = node.data.get("FinishActions") {
+                    if push_updates && let Some(acts) = fa.as_array() {
+                        let mut qctx = ctx.as_quest_ctx();
+                        let _ = quest_engine::push_bt_level_events_for_type(
+                            &mut qctx,
+                            BtType::BtTypeLevelPlay,
+                            lp_id,
+                            node.id,
+                            GameCtxType::FailedNodeAction,
+                            acts,
+                        );
+                    }
                     run_level_play_actions(
                         ctx,
                         lp_id,
@@ -2803,6 +2814,17 @@ pub fn on_fail_timer_due<S: PushSink + ?Sized>(
     if let Some(node) = node
         && let Some(fa) = node.data.get("FinishActions")
     {
+        if let Some(acts) = fa.as_array() {
+            let mut qctx = ctx.as_quest_ctx();
+            let _ = quest_engine::push_bt_level_events_for_type(
+                &mut qctx,
+                BtType::BtTypeLevelPlay,
+                lp_id,
+                node.id,
+                GameCtxType::FailedNodeAction,
+                acts,
+            );
+        }
         run_level_play_actions(ctx, lp_id, node.id, Some(fa), None);
     }
     on_level_play_enabled(ctx, lp_id, false)?;
@@ -3220,6 +3242,17 @@ pub fn on_player_move<S: PushSink + ?Sized>(
                 };
                 if let Some(reason) = fail_reason {
                     if let Some(fa) = node.data.get("FinishActions") {
+                        if let Some(acts) = fa.as_array() {
+                            let mut qctx = ctx.as_quest_ctx();
+                            let _ = quest_engine::push_bt_level_events_for_type(
+                                &mut qctx,
+                                BtType::BtTypeLevelPlay,
+                                lp_id,
+                                node.id,
+                                GameCtxType::FailedNodeAction,
+                                acts,
+                            );
+                        }
                         run_level_play_actions(ctx, lp_id, node.id, Some(fa), None);
                     }
                     on_bt_rollback(ctx, lp_id, node.id, reason)?;

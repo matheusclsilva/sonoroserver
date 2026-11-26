@@ -59,7 +59,7 @@ use sonoro_gamesv_logic::templates::role_entity_templates;
 use sonoro_proto::PbEnum;
 use sonoro_proto::enums::{
     AccessRangeType, BtType, EAttributeType, EClientStorageSystemIdType, EDamageImmune,
-    ESummonType, ErrorCode, GravityFlipType, RangeType,
+    ESummonType, ErrorCode, GameCtxType, GravityFlipType, RangeType,
 };
 use sonoro_proto::pb::{
     AbyssRankListRequest, AchievementInfoRequest, AfterJoinSceneNotify, BabelTowerRankListRequest,
@@ -5732,4 +5732,154 @@ fn audit_125_enable_nearby_tracking_pushes_notify_for_self_and_other_targets() {
         r#"{"Name":"EnableNearbyTracking","Params":{"IsEnable":false,"ControlType":{"Type":"Other","Entities":[]}}}"#,
     );
     assert!(notifies(&mut h).is_empty());
+}
+
+/// Push frames in send order, as (message id, payload).
+fn drain_push_frames(h: &mut TestHarness) -> Vec<(u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Ok(frame) = h.rx.try_recv() {
+        if frame.len() < 3 {
+            continue;
+        }
+        if let Ok(msg) = super::Message::decode(&frame[3..]) {
+            out.push((msg.header.message_id(), msg.payload.to_vec()));
+        }
+    }
+    out
+}
+
+/// `ActionNotify` frames (gamesv `LevelEventNotify`) as (frame index, ctx type, BtType, BtId,
+/// NodeId, StartIndex, EndIndex, TotalCount).
+fn bt_action_notifies(
+    frames: &[(u16, Vec<u8>)],
+) -> Vec<(usize, GameCtxType, Option<BtType>, i32, i32, i32, i32, i32)> {
+    use sonoro_proto::pb::{GameCtxPbCtxInfoOneof as Info, LevelEventNotify};
+    let mut out = Vec::new();
+    for (i, (id, payload)) in frames.iter().enumerate() {
+        if *id != LevelEventNotify::MSG_ID {
+            continue;
+        }
+        let n = <LevelEventNotify as sonoro_proto::wire::PbMessage>::decode(payload).unwrap();
+        let gctx = n.GameCtx.expect("GameCtx");
+        let bt = match gctx.CtxInfo.expect("CtxInfo") {
+            Info::FailedNodeAction(c) => c.BehaviorTreeCtx,
+            Info::SuccessNodeAction(c) => c.BehaviorTreeCtx,
+            Info::ActionGroupNodeAction(c) => c.BehaviorTreeCtx,
+            Info::ChildQuestNodeEnterAction(c) => c.BehaviorTreeCtx,
+            Info::ChildQuestNodeFinishAction(c) => c.BehaviorTreeCtx,
+            _ => None,
+        }
+        .unwrap_or_default();
+        assert_eq!(bt.IncId, i64::from(bt.BtId), "tree IncId is the owner id");
+        assert_eq!(n.IncId, bt.BtId, "notify IncId is the owner id");
+        out.push((
+            i,
+            gctx.CtxType.expect("CtxType"),
+            bt.BtType,
+            bt.BtId,
+            bt.NodeId,
+            n.StartIndex,
+            n.EndIndex,
+            n.TotalCount,
+        ));
+    }
+    out
+}
+
+#[test]
+fn audit_126_quest_failed_finish_actions_push_failed_node_action() {
+    use sonoro_proto::enums::FailReason;
+    use sonoro_proto::pb::{BtRollbackInfoNotify, BtRollbackNotify};
+
+    // LevelPlay 124000079 (parkour): QuestFailed 11 {Timer 120 CountDownChallenge,
+    // IsTransferFailure} FinishActions [PostAkEvent stop_function_music_worldgame_parkour].
+    const PARKOUR_LP: i32 = 124_000_079;
+    const PARKOUR_ANCHOR: [f32; 3] = [-37_329.65, 114_375.45, 4_519.92];
+    // Quest 42850002: 1 Sequence > [2 ReachArea, 4 ParallelSelect > [5 DoInteract, 6 QuestFailed],
+    // 7 ParallelSelect > [8, 13, 14, 16, 9 QuestFailed], 3 QuestSucceed]; QuestFailed 9
+    // FinishActions [FadeInScreen Black].
+    const QID: i32 = 42_850_002;
+
+    // (i) LevelPlay: the fail timer of a running QuestFailed fires (on_fail_timer_due).
+    let mut h = TestHarness::new("audit126a", Some(8));
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        let [x, y, z] = PARKOUR_ANCHOR;
+        level_play::on_player_move(&mut lctx, x, y, z).expect("lp move");
+    }
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(124_003_592, "关卡.Common.状态.激活");
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        level_play::step_entered_tree_by_id(&mut lctx, PARKOUR_LP).expect("step parkour");
+        assert!(level_play::on_timer_due(&mut lctx, PARKOUR_LP, 24).expect("node 24 timer"));
+    }
+    assert!(
+        h.state.scene.as_ref().unwrap().lp_fail_timers.get_due_ms(PARKOUR_LP, 11).is_some(),
+        "QuestFailed 11 must be running"
+    );
+    let _ = h.drain_count();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).unwrap();
+        assert!(level_play::on_fail_timer_due(&mut lctx, PARKOUR_LP, 11).expect("fail timer"));
+    }
+    let frames = drain_push_frames(&mut h);
+    let acts: Vec<_> = bt_action_notifies(&frames)
+        .into_iter()
+        .map(|(_, t, bt, id, nid, s, e, total)| (t, bt, id, nid, s, e, total))
+        .collect();
+    assert_eq!(
+        acts,
+        vec![(
+            GameCtxType::FailedNodeAction,
+            Some(BtType::BtTypeLevelPlay),
+            PARKOUR_LP,
+            11,
+            0,
+            0,
+            1
+        )]
+    );
+
+    // (ii) Quest: rollback to QuestFailed 9 sends its FinishActions after BtRollbackNotify
+    // (the client's PrepareRollback stops the tree's running actions) and before the tree is
+    // rebuilt by BtRollbackInfoNotify.
+    let mut h = TestHarness::new("audit126b", Some(8));
+    let mut events = EventQueue::new();
+    let nodes = h.state.assets.quest_nodes.get_owner_nodes(QID).expect("quest nodes");
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(quest_engine::tree::activate_quest(&mut qctx, QID, true).expect("activate"));
+    }
+    for nid in [2, 5] {
+        let node = nodes.iter().find(|n| n.id == nid).unwrap().clone();
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::complete_child_quest(&mut qctx, QID, &nodes, &node).expect("complete");
+    }
+    let aq = h.state.player_components.quest.info.find_active_quest(QID).unwrap();
+    assert!(aq.is_node_active(8), "ParallelSelect 7 must be running");
+    let _ = h.drain_count();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::rollback_quest_to_node(&mut qctx, QID, 9, FailReason::TransferFail, false)
+            .expect("rollback");
+    }
+    let frames = drain_push_frames(&mut h);
+    let failed: Vec<_> = bt_action_notifies(&frames)
+        .into_iter()
+        .filter(|a| a.1 == GameCtxType::FailedNodeAction)
+        .collect();
+    assert_eq!(failed.len(), 1, "one FailedNodeAction notify: {failed:?}");
+    let (pos, _, bt, id, nid, s, e, total) = failed[0];
+    assert_eq!((bt, id, nid, s, e, total), (Some(BtType::BtTypeQuest), QID, 9, 0, 0, 1));
+    let rollback = frames.iter().position(|f| f.0 == BtRollbackNotify::MSG_ID).unwrap();
+    let rebuild = frames.iter().position(|f| f.0 == BtRollbackInfoNotify::MSG_ID).unwrap();
+    assert!(rollback < pos && pos < rebuild, "order {rollback} < {pos} < {rebuild}");
 }

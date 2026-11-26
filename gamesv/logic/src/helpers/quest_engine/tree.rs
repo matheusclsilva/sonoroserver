@@ -2080,6 +2080,11 @@ pub fn rollback_quest_to_node<S: PushSink + ?Sized>(
     }
 
     if let Some(ref fn_entry) = fail_node_opt {
+        if fn_entry.node_type == "QuestFailed"
+            && let Some(Value::Array(acts)) = fn_entry.data.get("FinishActions")
+        {
+            push_bt_level_events(ctx, quest_id, fn_entry.id, GameCtxType::FailedNodeAction, acts)?;
+        }
         run_node_finish_effects(ctx, quest_id, fn_entry)?;
     }
 
