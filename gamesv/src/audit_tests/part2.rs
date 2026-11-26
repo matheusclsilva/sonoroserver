@@ -5496,3 +5496,125 @@ fn audit_123_level_play_only_opens_on_its_level_id_map() {
         "no EnterLevelPlayNotify for {SAMPLE_LP}"
     );
 }
+
+#[test]
+fn audit_124_get_skill_satisfied_by_captured_phantom_skill_echo() {
+    use sonoro_proto::pb::{CaptureBatchEntityRequest, CaptureEntityRequest};
+
+    // Quest 139000026: Sequence 173 > [175 Kill 139800002, 176 GetSkill
+    // {"SkillType":"NormalSkill","SkillId":200001}]. 200001 exists only as
+    // PhantomSkill.PhantomSkillId (Id 1); it is the SkillId of PhantomItem 60000182-60000185
+    // (MonsterId 390077021), the Echo whose phantom 139800002 leaves behind.
+    const QUEST_ID: i32 = 139_000_026;
+    const NODE_ID: i32 = 176;
+    const ECHO_ITEM: i32 = 60_000_182;
+
+    fn setup(prefix: &str) -> (TestHarness, EventQueue, i64) {
+        let mut h = TestHarness::new(prefix, Some(8));
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_or_add_active_quest(QUEST_ID)
+            .active_nodes
+            .push(NODE_ID);
+        let mut events = EventQueue::new();
+        let mob_nid = {
+            let mut st = EntityComponentStorage::new(
+                0,
+                ConfigComponent {
+                    camp: 1,
+                    config_id: 139_800_002,
+                    config_type: ConfigType::Level,
+                    entity_type: EntityType::Monster,
+                    state: EntityState::Default,
+                },
+            );
+            st.position = Some(PositionComponent {
+                location: [100.0, 200.0, 300.0],
+                rotation: [0.0; 3],
+            });
+            h.state.scene.as_mut().unwrap().spawn(st).net_id
+        };
+        {
+            let mut qctx = h.state.quest_context(&mut events);
+            let mut lp_ctx = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).expect("lp ctx");
+            level_play::on_entity_killed(&mut lp_ctx, mob_nid, Some(139_800_002))
+                .expect("kill 139800002");
+        }
+        let phantom_nid = h
+            .state
+            .scene
+            .as_ref()
+            .unwrap()
+            .entities
+            .iter()
+            .find(|e| e.world_item.monster_capture.is_some_and(|mc| mc.monster_id == 390_077_021))
+            .map(|e| e.net_id)
+            .expect("139800002 must leave a 390077021 Echo phantom");
+        // Killing alone grants no Echo, so GetSkill 200001 stays pending.
+        quest_engine::on_condition_state_changed(&mut h.state.quest_context(&mut events))
+            .expect("condition recheck");
+        assert!(h.state.player_components.echo.echo_map.is_empty());
+        assert!(
+            !node_done(&h),
+            "GetSkill 200001 must not complete before the Echo is captured"
+        );
+        (h, events, phantom_nid)
+    }
+    fn node_done(h: &TestHarness) -> bool {
+        h.state
+            .player_components
+            .quest
+            .info
+            .has_finished_child_quest(QUEST_ID, NODE_ID)
+    }
+    fn owns_echo(h: &TestHarness) -> bool {
+        h.state
+            .player_components
+            .echo
+            .echo_map
+            .values()
+            .any(|e| e.id == ECHO_ITEM)
+    }
+
+    assert_eq!(
+        super::shared_assets()
+            .tables
+            .phantom_item
+            .get_data_by_id(&ECHO_ITEM)
+            .map(|item| item.SkillId),
+        Some(200_001)
+    );
+
+    // CaptureEntityRequest
+    let (mut h, _events, phantom_nid) = setup("audit124a");
+    let resp = world_puzzle::handle_capture_entity_request(
+        &mut h.state,
+        CaptureEntityRequest { Id: phantom_nid },
+    )
+    .expect("capture");
+    assert_eq!(resp.ErrCode, Some(ErrorCode::Success));
+    assert!(owns_echo(&h), "capture must grant PhantomItem {ECHO_ITEM}");
+    assert!(
+        node_done(&h),
+        "capturing the 200001 Echo must complete quest {QUEST_ID} node {NODE_ID}"
+    );
+
+    // CaptureBatchEntityRequest
+    let (mut h, _events, phantom_nid) = setup("audit124b");
+    let resp = world_puzzle::handle_capture_batch_entity_request(
+        &mut h.state,
+        CaptureBatchEntityRequest {
+            InstId: 8,
+            Ids: vec![phantom_nid],
+        },
+    )
+    .expect("batch capture");
+    assert_eq!(resp.ErrCode, Some(ErrorCode::Success));
+    assert!(owns_echo(&h), "batch capture must grant PhantomItem {ECHO_ITEM}");
+    assert!(
+        node_done(&h),
+        "batch capturing the 200001 Echo must complete quest {QUEST_ID} node {NODE_ID}"
+    );
+}

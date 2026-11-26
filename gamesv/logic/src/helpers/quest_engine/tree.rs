@@ -286,6 +286,7 @@ fn recheck_pending_conditions_pass<S: PushSink + ?Sized>(
                 | "CheckLevelPlay"
                 | "CheckActivityState"
                 | "GetItem"
+                | "GetSkill"
                 | "VisionSystem"
                 | "ScheduleTime"
                 | "EnterDungeon"

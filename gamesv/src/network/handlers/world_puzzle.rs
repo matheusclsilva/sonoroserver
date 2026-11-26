@@ -2928,6 +2928,7 @@ pub fn handle_capture_entity_request(
             .progress
             .save(&state.fs)
             .map_err(|e| e.to_string())?;
+        flush_quest_condition_changed(state);
     }
     if !remove_infos.is_empty() {
         let _ = state.conn.push_msg(
@@ -2973,6 +2974,7 @@ pub fn handle_capture_batch_entity_request(
             .progress
             .save(&state.fs)
             .map_err(|e| e.to_string())?;
+        flush_quest_condition_changed(state);
     }
     if !remove_infos.is_empty() {
         let _ = state.conn.push_msg(

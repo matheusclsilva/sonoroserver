@@ -16,6 +16,7 @@ use sonoro_gamesv_data::tables::quest_data::DataEntry as QuestDataEntry;
 use sonoro_gamesv_fs::guide_info::GuideInfo;
 use sonoro_gamesv_fs::inventory_info::InventoryInfo;
 use sonoro_gamesv_fs::quest_info::{ActiveQuest, QuestInfo};
+use sonoro_gamesv_fs::special_item_incr::TRIAL_INCR_MIN;
 use sonoro_proto::enums::{
     BtType, ChildQuestNodeStatus, EAttributeType, GameCtxType, NodeStatus, QuestFocusReason,
     QuestState,
@@ -3696,6 +3697,8 @@ pub(super) fn should_auto_complete_child_quest<S: PushSink + ?Sized>(
                         s.explore_tools_info.active_explore_skill == sid
                             || s.explore_tools_info.unlocked_explore_skills.contains(&sid)
                     })
+                    || (json_str(cond.get("SkillType")) == Some("NormalSkill")
+                        && owns_echo_with_phantom_skill(ctx, sid))
             }),
         "FinishBvbChallenge" => json_int(cond.get("BvbChallengeId"))
             .filter(|&id| id > 0)
@@ -3733,6 +3736,23 @@ pub(super) fn should_auto_complete_child_quest<S: PushSink + ?Sized>(
         }
         _ => false,
     }
+}
+
+/// `PhantomItem.SkillId` is the echo's `PhantomSkill.PhantomSkillId`; a non-trial echo
+/// owning it means the player has that phantom skill.
+fn owns_echo_with_phantom_skill<S: PushSink + ?Sized>(
+    ctx: &QuestContext<'_, S>,
+    skill_id: i32,
+) -> bool {
+    ctx.echo_comp.echo_map.iter().any(|(&inc_id, echo)| {
+        inc_id < TRIAL_INCR_MIN
+            && ctx
+                .assets
+                .tables
+                .phantom_item
+                .get_data_by_id(&echo.id)
+                .is_some_and(|item| item.SkillId == skill_id)
+    })
 }
 
 #[cfg(test)]
