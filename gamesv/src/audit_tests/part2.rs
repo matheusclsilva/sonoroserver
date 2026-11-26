@@ -6013,3 +6013,77 @@ fn audit_127_save_config_enter_actions_push_composition_contexts() {
         .expect("BehaviorTreeInfoNotify");
     assert!(tree_info < enter[0].0);
 }
+
+#[test]
+fn audit_128_quest_data_actions_push_quest_contexts() {
+    use sonoro_proto::pb::{
+        GameCtxPbCtxInfoOneof as Info, LevelEventNotify, QuestFinishListNotify, QuestListNotify,
+    };
+
+    /// (frame index, ctx type, QuestId, StartIndex, EndIndex, TotalCount) of quest contexts.
+    fn quest_notifies(frames: &[(u16, Vec<u8>)]) -> Vec<(usize, GameCtxType, i32, i32, i32, i32)> {
+        let mut out = Vec::new();
+        for (i, (id, payload)) in frames.iter().enumerate() {
+            if *id != LevelEventNotify::MSG_ID {
+                continue;
+            }
+            let n = <LevelEventNotify as sonoro_proto::wire::PbMessage>::decode(payload).unwrap();
+            let gctx = n.GameCtx.expect("GameCtx");
+            let qid = match gctx.CtxInfo.expect("CtxInfo") {
+                Info::QuestActiveAction(c) => c.QuestId,
+                Info::QuestAcceptAction(c) => c.QuestId,
+                Info::QuestFinishAction(c) => c.QuestId,
+                _ => continue,
+            };
+            assert_eq!(n.IncId, qid);
+            let t = gctx.CtxType.expect("CtxType");
+            out.push((i, t, qid, n.StartIndex, n.EndIndex, n.TotalCount));
+        }
+        out
+    }
+
+    // QuestData 134000002: ActiveActions [AwakeEntity, PlayBubble], FinishActions [CommonTip].
+    // QuestData 134000000: AcceptActions [DestroyEntity, AwakeEntity, FadeOutScreen].
+    const BUBBLE_QID: i32 = 134_000_002;
+    const FADE_QID: i32 = 134_000_000;
+    let mut h = TestHarness::new("audit128", Some(8));
+    let mut events = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(quest_engine::tree::activate_quest(&mut qctx, BUBBLE_QID, true).expect("activate"));
+    }
+    let frames = drain_push_frames(&mut h);
+    let got = quest_notifies(&frames);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        (got[0].1, got[0].2, got[0].3, got[0].4, got[0].5),
+        (GameCtxType::QuestActiveAction, BUBBLE_QID, 1, 1, 2)
+    );
+    let listed = frames.iter().position(|f| f.0 == QuestListNotify::MSG_ID).unwrap();
+    assert!(listed < got[0].0, "the client must know the quest first");
+
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        quest_engine::tree::succeed_quest(&mut qctx, BUBBLE_QID).expect("succeed");
+    }
+    let frames = drain_push_frames(&mut h);
+    let got = quest_notifies(&frames);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        (got[0].1, got[0].2, got[0].3, got[0].4, got[0].5),
+        (GameCtxType::QuestFinishAction, BUBBLE_QID, 0, 0, 1)
+    );
+    let finished = frames.iter().position(|f| f.0 == QuestFinishListNotify::MSG_ID).unwrap();
+    assert!(got[0].0 < finished, "QuestFinishAction needs the client's Quest object");
+
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        assert!(quest_engine::tree::activate_quest(&mut qctx, FADE_QID, true).expect("activate"));
+    }
+    let frames = drain_push_frames(&mut h);
+    let got: Vec<_> = quest_notifies(&frames)
+        .into_iter()
+        .map(|a| (a.1, a.2, a.3, a.4, a.5))
+        .collect();
+    assert_eq!(got, vec![(GameCtxType::QuestAcceptAction, FADE_QID, 2, 2, 3)]);
+}

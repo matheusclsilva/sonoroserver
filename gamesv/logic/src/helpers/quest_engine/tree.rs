@@ -37,7 +37,7 @@ use super::triggers::{
     find_root_node, get_child_condition, init_tree_info, is_sync_play_flow_action,
     push_ancestor_activations, push_bt_composition_enter_events, push_bt_level_events,
     push_daily_and_branch_notifies, push_do_interact_options_for_node, push_node_status,
-    push_ready_quest_list,
+    push_quest_level_events, push_ready_quest_list,
     remove_do_interact_options_for_node, should_auto_complete_child_quest,
     snapshot_active_quest_ids, start_flow_from_obj, sync_scene_current_node,
     ensure_tracked_focus_valid,
@@ -633,7 +633,23 @@ pub fn activate_quest<S: PushSink + ?Sized>(
     }
 
     if let Some(q) = ctx.assets.tables.quest_data.get_data_by_id(&quest_id) {
+        if push_updates {
+            push_quest_level_events(
+                ctx,
+                quest_id,
+                GameCtxType::QuestActiveAction,
+                &q.Data.ActiveActions,
+            )?;
+        }
         execute_actions(ctx, quest_id, 0, &q.Data.ActiveActions)?;
+        if push_updates {
+            push_quest_level_events(
+                ctx,
+                quest_id,
+                GameCtxType::QuestAcceptAction,
+                &q.Data.AcceptActions,
+            )?;
+        }
         execute_actions(ctx, quest_id, 0, &q.Data.AcceptActions)?;
     }
 
@@ -2175,6 +2191,12 @@ pub fn succeed_quest<S: PushSink + ?Sized>(
     ctx.quest_comp.info.finish_quest(quest_id);
 
     if let Some(ref q) = quest_opt {
+        push_quest_level_events(
+            ctx,
+            quest_id,
+            GameCtxType::QuestFinishAction,
+            &q.Data.FinishActions,
+        )?;
         execute_actions(ctx, quest_id, 0, &q.Data.FinishActions)?;
     }
 

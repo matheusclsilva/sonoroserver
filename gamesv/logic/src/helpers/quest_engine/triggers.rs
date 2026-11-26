@@ -32,7 +32,8 @@ use sonoro_proto::pb::{
     FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GetItemCount, GetItemProgress,
     GroupFormation,
     InteractProgress, KillProgress, LevelEventNotify, NodeInfo, NodeInfoExtraInfoOneof,
-    QuestBranchUpdateNotify, QuestFinishListNotify, QuestInfo as PbQuestInfo,
+    QuestAcceptActionCtxPb, QuestActiveActionCtxPb, QuestBranchUpdateNotify,
+    QuestFinishActionCtxPb, QuestFinishListNotify, QuestInfo as PbQuestInfo,
     QuestListNotify, QuestReadyListNotify, QuestShowListNotify, SuccessNodeActionCtxPb,
     TimerInfoPb, TraceQuestNotify, TreeInfo, UpdateChildQuestNodeStatusNotify,
     UpdateGroupFormationNotify, UpdateNodeProgressNotify, UpdateNodeStatusNotify,
@@ -1859,6 +1860,35 @@ pub fn push_bt_composition_enter_events<S: PushSink + ?Sized>(
             enter_acts,
         )?;
     }
+    Ok(())
+}
+
+/// Client side of a quest's own `ActiveActions` / `AcceptActions` / `FinishActions` (QuestData).
+/// The client takes the list from the quest config (QuestActiveAction) or from its Quest
+/// object (QuestAcceptAction, QuestFinishAction), keyed by QuestId.
+pub fn push_quest_level_events<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    quest_id: i32,
+    ctx_type: GameCtxType,
+    actions: &[Value],
+) -> io::Result<()> {
+    let ctx_info = match ctx_type {
+        GameCtxType::QuestActiveAction => {
+            GameCtxPbCtxInfoOneof::QuestActiveAction(QuestActiveActionCtxPb { QuestId: quest_id })
+        }
+        GameCtxType::QuestAcceptAction => {
+            GameCtxPbCtxInfoOneof::QuestAcceptAction(QuestAcceptActionCtxPb { QuestId: quest_id })
+        }
+        GameCtxType::QuestFinishAction => {
+            GameCtxPbCtxInfoOneof::QuestFinishAction(QuestFinishActionCtxPb { QuestId: quest_id })
+        }
+        _ => return Ok(()),
+    };
+    let game_ctx = GameCtxPb {
+        CtxType: Some(ctx_type),
+        CtxInfo: Some(ctx_info),
+    };
+    push_level_event_ranges(ctx, quest_id, &game_ctx, actions);
     Ok(())
 }
 
