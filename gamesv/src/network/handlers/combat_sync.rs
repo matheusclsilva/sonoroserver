@@ -1443,6 +1443,17 @@ fn grant_destruction_reward(
     if taken {
         return Ok(());
     }
+    // Only the items the client data lists are paid: crate packages (2202, 1315, ...) have
+    // an empty DropPreview, and the chest override table is not client data.
+    let listed = state
+        .assets
+        .tables
+        .drop_package
+        .get_data_by_id(&reward_id)
+        .is_some_and(|pkg| !pkg.DropPreview.is_empty());
+    if !listed {
+        return Ok(());
+    }
     {
         let mut rctx = state.reward_context();
         reward::grant_world_pickup_drop_package(&mut rctx, reward_id, 1)

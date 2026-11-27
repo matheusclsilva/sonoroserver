@@ -9020,4 +9020,49 @@ fn audit_150_destroyed_destructible_pays_its_reward_once() {
         ore_item_notifies(&frames).is_empty(),
         "no second reward while the ore is on its respawn cooldown"
     );
+
+    // 3. A crate's package (SceneObj001 104000154, RewardId 2202) has an empty DropPreview:
+    //    nothing the client data lists, so nothing is paid.
+    const CRATE_CFG: i64 = 104_000_154;
+    entity_cmd::spawn_with_location(
+        &mut events,
+        h.state.scene.as_mut().unwrap(),
+        &h.state.fs,
+        &h.state.assets,
+        &mut h.state.conn,
+        &h.state.player_components.basic,
+        CRATE_CFG,
+        Some(false),
+        Some(false),
+        Some(8),
+        Some([0.0, 0.0, 0.0]),
+        true,
+    )
+    .expect("spawn crate");
+    let crate_nid = h
+        .state
+        .scene
+        .as_ref()
+        .unwrap()
+        .find_entity_net_id_by_config_id(i32::try_from(CRATE_CFG).unwrap())
+        .expect("crate net id");
+    let coins_before = h.state.player_components.basic.info.attributes.coin;
+    let _ = h.drain_count();
+    combat_sync::handle_throw_damage_request(
+        &mut h.state,
+        &mut events,
+        ThrowDamageRequest {
+            EntityId: crate_nid,
+            ..Default::default()
+        },
+    )
+    .expect("break crate");
+    assert!(h.state.scene.as_ref().unwrap().entity(crate_nid).is_none(), "crate destroyed");
+    let frames = drain_raw(&mut h);
+    assert!(
+        of::<NormalItemAddNotify>(&frames, NormalItemAddNotify::MSG_ID).is_empty()
+            && of::<NormalItemUpdateNotify>(&frames, NormalItemUpdateNotify::MSG_ID).is_empty(),
+        "an empty DropPreview pays nothing"
+    );
+    assert_eq!(h.state.player_components.basic.info.attributes.coin, coins_before);
 }
