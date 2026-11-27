@@ -1666,18 +1666,19 @@ fn evict_distant_ambient_entities<S: PushSink + ?Sized>(
         if is_kept_world_entity(s, scene, assets, quest_info, active_quest_targets) {
             continue;
         }
-        if skip_priority
-            && s.config.config_id > 0
-            && let Some(raw_cfg) =
-                assets.find_level_entity(scene.instance_id, i64::from(s.config.config_id))
-            && is_priority_world_entity(assets, &raw_cfg)
-        {
-            continue;
-        }
-
         let Some(pos) = s.position else {
             continue;
         };
+        if s.config.config_id > 0
+            && let Some(raw_cfg) =
+                assets.find_level_entity(scene.instance_id, i64::from(s.config.config_id))
+            && is_priority_world_entity(assets, &raw_cfg)
+            // The client keeps an entity inside its 2D AOI; evicting such a teleporter by 3D
+            // distance would only see teleporters_in_client_aoi spawn it again.
+            && (skip_priority || in_client_aoi(assets, &raw_cfg, pos.location, player_loc))
+        {
+            continue;
+        }
         let dx = pos.location[0] - player_loc[0];
         let dy = pos.location[1] - player_loc[1];
         let dz = pos.location[2] - player_loc[2];

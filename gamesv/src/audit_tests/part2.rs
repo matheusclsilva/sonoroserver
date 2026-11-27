@@ -9166,4 +9166,33 @@ fn audit_151_full_town_scene_spawns_teleporters_inside_client_aoi() {
         sc.find_entity_net_id_by_config_id(OUT_OF_AOI).is_none(),
         "beacon {OUT_OF_AOI} is outside its 240 m AOI"
     );
+
+    // The full scene also runs evict_distant_ambient_entities, whose 230+ pass evicts by 3D
+    // distance. 300 m below, 109005326 is still inside its 2D AOI but past 320 m in 3D: it must
+    // stay instead of being removed and spawned again on every check.
+    let beacon_nid = sc.find_entity_net_id_by_config_id(ABOVE_SCAN).unwrap();
+    h.state.scene.as_mut().unwrap().instance.players[0].location =
+        [PLAYER[0], PLAYER[1], PLAYER[2] - 30_000.0];
+    for _ in 0..2 {
+        assert!(h.state.scene.as_ref().unwrap().entities.len() >= 230);
+        events.enqueue(Event::SpatialSpawnsCheck {
+            player_id: h.state.player_id,
+        });
+        while let Some(ev) = events.dequeue() {
+            let mut rt = h.state.as_runtime(&mut events, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+        }
+        let frames = drain_push_frames(&mut h);
+        let removed: Vec<i64> = frames
+            .iter()
+            .filter(|(id, _)| *id == sonoro_proto::pb::EntityRemoveNotify::MSG_ID)
+            .flat_map(|(_, p)| sonoro_proto::pb::EntityRemoveNotify::decode(p).unwrap().RemoveInfos)
+            .map(|r| r.EntityId)
+            .collect();
+        assert!(!removed.contains(&beacon_nid), "in-AOI beacon evicted by 3D distance");
+        assert_eq!(
+            h.state.scene.as_ref().unwrap().find_entity_net_id_by_config_id(ABOVE_SCAN),
+            Some(beacon_nid)
+        );
+    }
 }
