@@ -36,6 +36,7 @@ use super::triggers::{
     eval_compare_var_list, execute_actions, extract_node_action_items, find_node_by_id,
     find_root_node, get_child_condition, init_tree_info, is_sync_play_flow_action,
     push_ancestor_activations, push_bt_composition_enter_events, push_bt_level_events,
+    push_bt_level_events_range, push_child_quest_finished_status,
     push_daily_and_branch_notifies, push_do_interact_options_for_node, push_node_status,
     push_quest_level_events, push_ready_quest_list,
     remove_do_interact_options_for_node, should_auto_complete_child_quest,
@@ -1083,8 +1084,9 @@ fn step_child_quest<S: PushSink + ?Sized>(
         on_enter_child_quest_special(ctx, quest_id, node)?;
     }
 
-    if should_auto_complete_child_quest(ctx, quest_id, node) {
-        complete_child_quest_without_advance(ctx, quest_id, node, push_updates)?;
+    if should_auto_complete_child_quest(ctx, quest_id, node)
+        && complete_child_quest_without_advance(ctx, quest_id, node, push_updates)?
+    {
         return Ok(StepResult::Completed);
     }
     Ok(StepResult::Running)
@@ -1285,8 +1287,10 @@ pub fn complete_child_quest<S: PushSink + ?Sized>(
     _nodes: &[NodeEntry],
     node: &NodeEntry,
 ) -> io::Result<()> {
-    complete_child_quest_without_advance(ctx, quest_id, node, true)?;
-    advance_quest_tree(ctx, quest_id, true)
+    if complete_child_quest_without_advance(ctx, quest_id, node, true)? {
+        advance_quest_tree(ctx, quest_id, true)?;
+    }
+    Ok(())
 }
 
 pub fn complete_child_quest_without_advance<S: PushSink + ?Sized>(
@@ -1294,24 +1298,103 @@ pub fn complete_child_quest_without_advance<S: PushSink + ?Sized>(
     quest_id: i32,
     node: &NodeEntry,
     push_updates: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if let Some(scene) = ctx.scene.as_deref_mut() {
         scene.quest_timers.cancel(quest_id, node.id);
     }
     remove_do_interact_options_for_node(ctx, quest_id, node.id);
-    if !ctx.quest_comp.info.mark_node_finished(quest_id, node.id) {
-        return Ok(());
+    let Some(aq) = ctx.quest_comp.info.find_active_quest(quest_id) else {
+        return Ok(false);
+    };
+    if aq.is_node_finished(node.id) {
+        return Ok(false);
     }
+    let akey = action_node_progress_key(quest_id, node.id);
+    if ctx
+        .scene
+        .as_deref()
+        .is_some_and(|s| s.child_finish_action_next_idx.contains_key(&akey))
+    {
+        return Ok(false);
+    }
+    resume_child_quest_finish_actions(ctx, quest_id, node, 0, push_updates)
+}
+
+pub fn resume_child_quest_finish_actions<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    quest_id: i32,
+    node: &NodeEntry,
+    start_idx: usize,
+    push_updates: bool,
+) -> io::Result<bool> {
+    let acts = node
+        .data
+        .get("FinishActions")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let akey = action_node_progress_key(quest_id, node.id);
+    let mut seg_start = start_idx;
+    while seg_start < acts.len() {
+        let sync_opt = if push_updates && ctx.scene.is_some() {
+            acts[seg_start..]
+                .iter()
+                .position(is_sync_play_flow_action)
+                .map(|rel| seg_start + rel)
+        } else {
+            None
+        };
+        if let Some(sync_idx) = sync_opt {
+            if push_updates && sync_idx > seg_start {
+                push_bt_level_events_range(
+                    ctx,
+                    quest_id,
+                    node.id,
+                    GameCtxType::ChildQuestNodeFinishAction,
+                    acts,
+                    seg_start,
+                    sync_idx,
+                )?;
+            }
+            execute_actions(ctx, quest_id, node.id, &acts[seg_start..=sync_idx])?;
+            let waiting_flow = ctx.scene.as_deref().is_some_and(|scene| {
+                (scene.active_flow_inc_id != 0
+                    && scene.active_flow_quest_id == quest_id
+                    && scene.active_flow_node_id == node.id)
+                    || scene.has_pending_flow_for_node(quest_id, node.id)
+            });
+            if waiting_flow && let Some(scene) = ctx.scene.as_deref_mut() {
+                scene.child_finish_action_next_idx.insert(akey, sync_idx + 1);
+                return Ok(false);
+            }
+            seg_start = sync_idx + 1;
+        } else {
+            if push_updates && seg_start < acts.len() {
+                push_bt_level_events_range(
+                    ctx,
+                    quest_id,
+                    node.id,
+                    GameCtxType::ChildQuestNodeFinishAction,
+                    acts,
+                    seg_start,
+                    acts.len(),
+                )?;
+            }
+            execute_actions(ctx, quest_id, node.id, &acts[seg_start..])?;
+            break;
+        }
+    }
+
+    if let Some(scene) = ctx.scene.as_deref_mut() {
+        scene.child_finish_action_next_idx.remove(&akey);
+    }
+    if node.reward_id > 0 {
+        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), node.reward_id, 6003)?;
+    }
+    ctx.quest_comp.info.mark_node_finished(quest_id, node.id);
     if push_updates {
-        push_node_status(
-            ctx,
-            quest_id,
-            node.id,
-            NodeStatus::CompletedSuccess,
-            ChildQuestNodeStatus::Finished,
-        )?;
+        push_child_quest_finished_status(ctx, quest_id, node.id);
     }
-    run_node_finish_effects(ctx, quest_id, node)
+    Ok(true)
 }
 
 pub fn finish_non_child_node<S: PushSink + ?Sized>(

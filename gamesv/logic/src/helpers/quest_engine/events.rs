@@ -2787,31 +2787,48 @@ pub fn on_flow_end_with_options<S: PushSink + ?Sized>(
                         .is_some_and(|aq| aq.is_node_active(matched_nid))
                     {
                         if let Some(node) = find_node_by_id(&nodes, matched_nid).cloned() {
-                            let mut ready_to_complete = true;
-                            if let Some(cond) = get_child_condition(&node.data)
-                                && json_str(cond.get("Type")) == Some("DoInteract")
-                            {
-                                let cfg_id = resolve_config_id(
-                                    ctx.scene.as_deref(),
-                                    owner_entity_id,
-                                );
-                                if let Some(matched_opt) =
-                                    match_do_interact(cond, owner_entity_id, cfg_id, 0).cloned()
-                                {
-                                    ready_to_complete = mark_and_check_do_interact_complete(
-                                        ctx,
-                                        matched_qid,
-                                        &node,
-                                        cond,
-                                        owner_entity_id,
-                                        &matched_opt,
-                                    )?;
+                            let pending_finish_idx = ctx.scene.as_deref_mut().and_then(|s| {
+                                s.child_finish_action_next_idx
+                                    .remove(&action_node_progress_key(matched_qid, matched_nid))
+                            });
+                            if let Some(next_idx) = pending_finish_idx {
+                                if super::tree::resume_child_quest_finish_actions(
+                                    ctx,
+                                    matched_qid,
+                                    &node,
+                                    next_idx,
+                                    true,
+                                )? {
+                                    advance_quest_tree(ctx, matched_qid, true)?;
                                 }
+                                finalize_progression(ctx)?;
+                            } else {
+                                let mut ready_to_complete = true;
+                                if let Some(cond) = get_child_condition(&node.data)
+                                    && json_str(cond.get("Type")) == Some("DoInteract")
+                                {
+                                    let cfg_id = resolve_config_id(
+                                        ctx.scene.as_deref(),
+                                        owner_entity_id,
+                                    );
+                                    if let Some(matched_opt) =
+                                        match_do_interact(cond, owner_entity_id, cfg_id, 0).cloned()
+                                    {
+                                        ready_to_complete = mark_and_check_do_interact_complete(
+                                            ctx,
+                                            matched_qid,
+                                            &node,
+                                            cond,
+                                            owner_entity_id,
+                                            &matched_opt,
+                                        )?;
+                                    }
+                                }
+                                if ready_to_complete {
+                                    complete_child_quest(ctx, matched_qid, &nodes, &node)?;
+                                }
+                                finalize_progression(ctx)?;
                             }
-                            if ready_to_complete {
-                                complete_child_quest(ctx, matched_qid, &nodes, &node)?;
-                            }
-                            finalize_progression(ctx)?;
                         }
                     } else if let Some(node) = find_node_by_id(&nodes, matched_nid).cloned()
                         && (node.node_type == "Action" || node.node_type == "ActionWithResult")

@@ -1820,7 +1820,30 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
     ctx_type: GameCtxType,
     actions: &[Value],
 ) -> io::Result<()> {
-    if actions.is_empty() {
+    push_bt_level_events_for_type_range(
+        ctx,
+        bt_type,
+        owner_id,
+        node_id,
+        ctx_type,
+        actions,
+        0,
+        actions.len(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_bt_level_events_for_type_range<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    bt_type: BtType,
+    owner_id: i32,
+    node_id: i32,
+    ctx_type: GameCtxType,
+    actions: &[Value],
+    slice_start: usize,
+    slice_end: usize,
+) -> io::Result<()> {
+    if actions.is_empty() || slice_start >= slice_end.min(actions.len()) {
         return Ok(());
     }
     let bt_ctx = BehaviorTreeCtxPb {
@@ -1866,8 +1889,37 @@ pub fn push_bt_level_events_for_type<S: PushSink + ?Sized>(
         CtxType: Some(ctx_type),
         CtxInfo: Some(ctx_info),
     };
-    push_level_event_ranges(ctx, owner_id, &game_ctx, actions);
+    push_level_event_ranges_slice_with(
+        ctx,
+        owner_id,
+        &game_ctx,
+        actions,
+        slice_start,
+        slice_end,
+        is_client_executable_bt_action,
+    );
     Ok(())
+}
+
+pub fn push_bt_level_events_range<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    quest_id: i32,
+    node_id: i32,
+    ctx_type: GameCtxType,
+    actions: &[Value],
+    slice_start: usize,
+    slice_end: usize,
+) -> io::Result<()> {
+    push_bt_level_events_for_type_range(
+        ctx,
+        BtType::BtTypeQuest,
+        quest_id,
+        node_id,
+        ctx_type,
+        actions,
+        slice_start,
+        slice_end,
+    )
 }
 
 /// Client side of a composite node's `SaveConfig` when the node is entered. The client
@@ -2030,16 +2082,37 @@ fn push_level_event_ranges_with<S: PushSink + ?Sized>(
     actions: &[Value],
     is_forwarded: fn(&QuestContext<'_, S>, &Value) -> bool,
 ) {
+    push_level_event_ranges_slice_with(
+        ctx,
+        inc_id,
+        game_ctx,
+        actions,
+        0,
+        actions.len(),
+        is_forwarded,
+    );
+}
+
+fn push_level_event_ranges_slice_with<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    inc_id: i32,
+    game_ctx: &GameCtxPb,
+    actions: &[Value],
+    slice_start: usize,
+    slice_end: usize,
+    is_forwarded: fn(&QuestContext<'_, S>, &Value) -> bool,
+) {
     let total_count = actions.len() as i32;
+    let bound = slice_end.min(actions.len());
     let player_id = ctx.basic_comp.player_id;
-    let mut i = 0usize;
-    while i < actions.len() {
+    let mut i = slice_start;
+    while i < bound {
         if !is_forwarded(ctx, &actions[i]) {
             i += 1;
             continue;
         }
         let start_idx = i;
-        while i < actions.len() && is_forwarded(ctx, &actions[i]) {
+        while i < bound && is_forwarded(ctx, &actions[i]) {
             i += 1;
         }
         let end_idx = i - 1;
@@ -2653,24 +2726,7 @@ pub fn push_node_status<S: PushSink + ?Sized>(
             GameCtxType::ChildQuestNodeFinishAction,
             node_action_items_pub(node_opt, "FinishActions"),
         )?;
-        ctx.sink.push(
-            UpdateChildQuestNodeStatusNotify::MSG_ID,
-            &UpdateChildQuestNodeStatusNotify {
-                TreeOwnerId: quest_id,
-                TreeIncId: i64::from(quest_id),
-                NodeId: node_id,
-                Status: Some(child_status),
-            },
-        );
-        ctx.sink.push(
-            UpdateNodeStatusNotify::MSG_ID,
-            &UpdateNodeStatusNotify {
-                TreeOwnerId: quest_id,
-                TreeIncId: i64::from(quest_id),
-                NodeId: node_id,
-                Status: Some(node_status),
-            },
-        );
+        push_child_quest_finished_status(ctx, quest_id, node_id);
     } else {
         ctx.sink.push(
             UpdateNodeStatusNotify::MSG_ID,
@@ -2692,6 +2748,31 @@ pub fn push_node_status<S: PushSink + ?Sized>(
         );
     }
     Ok(())
+}
+
+pub fn push_child_quest_finished_status<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    quest_id: i32,
+    node_id: i32,
+) {
+    ctx.sink.push(
+        UpdateChildQuestNodeStatusNotify::MSG_ID,
+        &UpdateChildQuestNodeStatusNotify {
+            TreeOwnerId: quest_id,
+            TreeIncId: i64::from(quest_id),
+            NodeId: node_id,
+            Status: Some(ChildQuestNodeStatus::Finished),
+        },
+    );
+    ctx.sink.push(
+        UpdateNodeStatusNotify::MSG_ID,
+        &UpdateNodeStatusNotify {
+            TreeOwnerId: quest_id,
+            TreeIncId: i64::from(quest_id),
+            NodeId: node_id,
+            Status: Some(NodeStatus::CompletedSuccess),
+        },
+    );
 }
 
 pub fn ensure_tracked_focus_valid<S: PushSink + ?Sized>(ctx: &mut QuestContext<'_, S>) {

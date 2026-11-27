@@ -9,7 +9,9 @@ use serde_json::Value;
 use sonoro_gamesv_data::asset_indexes::entity_world_pos;
 use sonoro_gamesv_data::lazy_node_store::NodeEntry;
 use sonoro_gamesv_fs::quest_info::{QuestInfo, append_unique_int, remove_int_value};
-use sonoro_proto::enums::{BtType, ErrorCode, QuestFocusReason, QuestLockType, QuestState};
+use sonoro_proto::enums::{
+    BtType, ErrorCode, GameCtxType, QuestFocusReason, QuestLockType, QuestState,
+};
 use sonoro_proto::pb::{
     BehaviorTreeCtxPb, BtCancelRangeFailWarningNotify, ConditionGroupFinishInfo, DailyQuestReward,
     DestroyQuestsNotify, FlowEndNotify, FlowStartNotify, FocusQuestSetNotify, GameCtxPb,
@@ -429,6 +431,16 @@ pub fn on_scene_loading_finish<S: PushSink + ?Sized>(
     {
         if let Some(scene) = ctx.scene.as_deref_mut() {
             scene.prologue_flow_started = true;
+        }
+        if let Some(Value::Array(enter_acts)) = node.data.get("EnterActions") {
+            triggers::push_bt_level_events(
+                ctx,
+                PROLOGUE_QUEST_ID,
+                19,
+                GameCtxType::ChildQuestNodeEnterAction,
+                enter_acts,
+            )?;
+            triggers::execute_actions(ctx, PROLOGUE_QUEST_ID, 19, enter_acts)?;
         }
         triggers::start_flow_from_obj(ctx, PROLOGUE_QUEST_ID, 19, flow_val)?;
     }
@@ -999,7 +1011,7 @@ pub fn gm_skip_quest_node<S: PushSink + ?Sized>(
             continue;
         };
         if node.node_type == "ChildQuest" {
-            tree::complete_child_quest_without_advance(ctx, quest_id, &node, true)?;
+            let _ = tree::complete_child_quest_without_advance(ctx, quest_id, &node, true)?;
         } else {
             tree::finish_non_child_node(ctx, quest_id, &node, true)?;
         }

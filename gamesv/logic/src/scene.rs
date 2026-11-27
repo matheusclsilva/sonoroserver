@@ -291,6 +291,7 @@ pub struct Scene {
     pub auto_interact_states: HashMap<i64, bool>,
     pub async_flows: Vec<AsyncFlowEntry>,
     pub action_node_next_idx: HashMap<u64, usize>,
+    pub child_finish_action_next_idx: HashMap<u64, usize>,
     pub last_server_rollback_quest_id: i32,
     pub last_server_rollback_ms: i64,
     pub summoned_entities: HashMap<String, Vec<i64>>,
@@ -387,6 +388,7 @@ impl Scene {
             auto_interact_states: HashMap::new(),
             async_flows: Vec::new(),
             action_node_next_idx: HashMap::new(),
+            child_finish_action_next_idx: HashMap::new(),
             last_server_rollback_quest_id: 0,
             last_server_rollback_ms: 0,
             summoned_entities: HashMap::new(),
@@ -541,6 +543,8 @@ impl Scene {
         let prefix = ((owner_id as u32) as u64) << 32;
         let mask = 0xFFFF_FFFF_0000_0000u64;
         self.action_node_next_idx
+            .retain(|&k, _| (k & mask) != prefix);
+        self.child_finish_action_next_idx
             .retain(|&k, _| (k & mask) != prefix);
     }
 

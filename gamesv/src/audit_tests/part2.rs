@@ -8237,3 +8237,187 @@ fn audit_146_guide_trigger_waits_for_guide_finish_request() {
         .expect("prologue active");
     assert!(aq.is_node_finished(146), "Node 146 should complete after GuideFinishRequest 10018");
 }
+
+#[test]
+fn audit_147_child_quest_finish_actions_pause_on_sync_play_flow() {
+    let mut h = TestHarness::new("audit147", Some(8));
+    let _ = h.drain_count();
+
+    const QUEST_ID: i32 = 139_000_025;
+
+    // Test A: Node 8 (和龙对视) has sync PlayFlow(1, 8) followed by AwakeEntity([310000587, 310000586]).
+    let nodes = h
+        .state
+        .assets
+        .quest_nodes
+        .get_owner_nodes(QUEST_ID)
+        .expect("139000025 nodes");
+    let node8 = nodes.iter().find(|n| n.id == 8).cloned().expect("Node 8");
+    let pre_finished: Vec<i32> = vec![19, 23, 77, 114, 111];
+    h.state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: QUEST_ID,
+            active_nodes: vec![8, 190],
+            finished_nodes: pre_finished,
+            killed_entities: Vec::new(),
+        });
+    let _ = h.drain_count();
+
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::tree::complete_child_quest(&mut qctx, QUEST_ID, &nodes, &node8)
+            .expect("complete_child_quest node 8");
+    }
+
+    let starts: Vec<FlowStartNotify> = h.drain_decoded(FlowStartNotify::MSG_ID);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].FlowId, 1);
+    assert_eq!(starts[0].StateId, 8);
+    let flow8_inc_id = starts[0].FlowIncId;
+
+    let aq = h
+        .state
+        .player_components
+        .quest
+        .info
+        .find_active_quest(QUEST_ID)
+        .expect("prologue active");
+    assert!(
+        aq.is_node_active(8) && !aq.is_node_finished(8),
+        "Node 8 must stay active until sync PlayFlow(1, 8) ends"
+    );
+    assert!(!aq.is_node_active(9), "Node 9 must not activate before PlayFlow(1, 8) ends");
+    assert!(
+        !h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .entities
+            .iter()
+            .any(|e| e.config.config_id == 310_000_587),
+        "AwakeEntity 310000587 after PlayFlow(1, 8) must wait for FlowEnd"
+    );
+
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::on_flow_end_with_options(&mut qctx, flow8_inc_id, &BTreeMap::new(), false)
+            .expect("end PlayFlow(1, 8)");
+    }
+
+    let aq = h
+        .state
+        .player_components
+        .quest
+        .info
+        .find_active_quest(QUEST_ID)
+        .expect("prologue active");
+    assert!(aq.is_node_finished(8), "Node 8 should finish after FlowEnd");
+    assert!(aq.is_node_finished(136), "ParallelSelect 136 should finish");
+    assert!(aq.is_node_active(9), "Node 9 should activate after Node 8 completes");
+    assert!(
+        h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .entities
+            .iter()
+            .any(|e| e.config.config_id == 310_000_587),
+        "AwakeEntity 310000587 should run after PlayFlow(1, 8) ends"
+    );
+
+    // Test B: Node 159 has sync PlayFlow(1, 25) followed by sync PlayFlow(1, 24).
+    //         Both must execute sequentially on separate FlowEnds before Quest 139000025 succeeds.
+    let node159 = nodes
+        .iter()
+        .find(|n| n.id == 159)
+        .cloned()
+        .expect("Node 159");
+    let finished_before_159: Vec<i32> = vec![
+        19, 23, 77, 114, 111, 136, 78, 155, 100, 29, 191, 103, 195, 97, 35,
+    ];
+    {
+        let aq_mut = h
+            .state
+            .player_components
+            .quest
+            .info
+            .find_active_quest_mut(QUEST_ID)
+            .expect("prologue active");
+        aq_mut.active_nodes = vec![159];
+        aq_mut.finished_nodes = finished_before_159;
+    }
+    if let Some(sc) = h.state.scene.as_mut() {
+        sc.clear_active_flow();
+        sc.child_finish_action_next_idx.clear();
+    }
+    let _ = h.drain_count();
+
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::tree::complete_child_quest(&mut qctx, QUEST_ID, &nodes, &node159)
+            .expect("complete_child_quest node 159");
+    }
+
+    let starts1: Vec<FlowStartNotify> = h.drain_decoded(FlowStartNotify::MSG_ID);
+    assert_eq!(starts1.len(), 1);
+    assert_eq!(starts1[0].StateId, 25);
+    assert!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .has_active_quest(QUEST_ID)
+    );
+
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::on_flow_end_with_options(
+            &mut qctx,
+            starts1[0].FlowIncId,
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("end PlayFlow(1, 25)");
+    }
+
+    let starts2: Vec<FlowStartNotify> = h.drain_decoded(FlowStartNotify::MSG_ID);
+    assert_eq!(starts2.len(), 1);
+    assert_eq!(starts2[0].StateId, 24);
+    assert!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .has_active_quest(QUEST_ID),
+        "Prologue must stay active while PlayFlow(1, 24) is playing"
+    );
+
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::on_flow_end_with_options(
+            &mut qctx,
+            starts2[0].FlowIncId,
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("end PlayFlow(1, 24)");
+    }
+
+    assert!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .has_finished_quest(QUEST_ID),
+        "Quest 139000025 should finish once all sync PlayFlows in Node 159 complete"
+    );
+}
