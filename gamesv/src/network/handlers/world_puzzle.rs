@@ -1200,7 +1200,7 @@ pub fn handle_elevator_state_change_request(
             ErrorCode: Some(ErrorCode::ErrElevatorConfigNotExit),
         });
     }
-    let _ = instance_id;
+    let map_id = state.assets.resolve_map_config_id(instance_id);
     let prev_location = state
         .scene
         .as_ref()
@@ -1209,51 +1209,69 @@ pub fn handle_elevator_state_change_request(
         .map(|l| l.location)
         .unwrap_or(0);
     // The client never sets 关卡.电梯.* itself; it only reports Forward (moving up),
-    // Reverse (moving down) and End (arrived), so the server owns the entity state.
-    // `State` is a proto3 enum: the client omits the default `End` (0) on the wire, so a
-    // missing field means the lift arrived.
+    // Reverse (moving down) for AutoMove lifts, and End (arrived) for all lifts, so the
+    // server owns the entity state. `State` is a proto3 enum: the client omits the default
+    // `End` (0) on the wire, so a missing field means the lift arrived.
     let elevator_state_name = match req.State {
-        Some(sonoro_proto::enums::ElevatorState::Forward) => Some("关卡.电梯.上升"),
-        Some(sonoro_proto::enums::ElevatorState::Reverse) => Some("关卡.电梯.下降"),
-        Some(sonoro_proto::enums::ElevatorState::End) | None => Some("关卡.电梯.停靠"),
+        Some(sonoro_proto::enums::ElevatorState::Forward) => "关卡.电梯.上升",
+        Some(sonoro_proto::enums::ElevatorState::Reverse) => "关卡.电梯.下降",
+        Some(sonoro_proto::enums::ElevatorState::End) | None => "关卡.电梯.停靠",
     };
     if let Some(scene) = state.scene.as_mut()
         && let Some(&idx) = scene.net_id_map.get(&req.EntityId)
     {
+        let init_pos = scene.entities[idx].world_item.lift_init_pos;
         scene.entities[idx].world_item.lift = Some(EntityLiftComponent {
             location: req.TagState,
         });
-        if let Some(state_name) = elevator_state_name {
-            scene.update_entity_state_tag(
-                &state.assets.tables.gameplay_tag_remap,
-                req.EntityId,
-                state_name,
+        if let Some(base_pos) = init_pos
+            && let Some(pos) = scene.entities[idx].position.as_mut()
+        {
+            pos.location = sonoro_gamesv_logic::commands::entity::lift_floor_pos_for_entity(
+                state.assets.as_ref(),
+                map_id,
+                config_id,
+                base_pos,
+                req.TagState,
             );
         }
     }
     let info = &mut state.player_components.progress.info;
     info.set_key_int(&format!("elevator:{config_id}"), i64::from(req.TagState));
     info.set_key_int(&format!("lift_target:{config_id}"), i64::from(req.TagState));
-    if let Some(state_name) = elevator_state_name {
-        state
-            .player_components
-            .quest
-            .info
-            .set_entity_state(i64::from(config_id), state_name);
-        state
-            .player_components
-            .quest
-            .save(&state.fs)
-            .map_err(|e| e.to_string())?;
-    }
     state
         .player_components
         .progress
         .save(&state.fs)
         .map_err(|e| e.to_string())?;
+    {
+        let mut events = EventQueue::new();
+        {
+            let mut qctx = state.quest_context(&mut events);
+            let cbs = quest_engine::action_callbacks();
+            quest_actions::apply_entity_state_change(
+                &mut qctx,
+                &cbs,
+                config_id,
+                elevator_state_name,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        drain_event_queue_best_effort(&mut events, state);
+    }
+    state
+        .player_components
+        .quest
+        .save(&state.fs)
+        .map_err(|e| e.to_string())?;
     flush_quest_condition_changed(state);
-    if req.State != Some(sonoro_proto::enums::ElevatorState::End)
-        && req.TagState > 0
+    if matches!(
+        req.State,
+        Some(
+            sonoro_proto::enums::ElevatorState::Forward
+                | sonoro_proto::enums::ElevatorState::Reverse
+        )
+    ) && req.TagState > 0
         && prev_location != req.TagState
     {
         let _ = state.conn.push_msg(

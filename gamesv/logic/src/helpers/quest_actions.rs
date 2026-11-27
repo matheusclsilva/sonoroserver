@@ -12,7 +12,7 @@ use sonoro_gamesv_fs::last_scene_info::LastSceneInfo;
 use sonoro_gamesv_fs::quest_info::{QuestInfo, append_unique_int, append_unique_str, remove_int_value, remove_str_value};
 use sonoro_proto::enums::{
     BtType, ChangeReason, ERemoveEntityType, ExitVehicleType, GameCtxType, GravityFlipType,
-    IllustratedType, MoveStatus, SuspendType, TeleportReason,
+    IllustratedType, LiftMoveType, MoveStatus, SuspendType, TeleportReason,
 };
 use sonoro_proto::pb::{
     AddGuestNotify, AlertArea, AlertAreaNotify, AudioStatePb, AudioStateUpdateNotify,
@@ -23,7 +23,8 @@ use sonoro_proto::pb::{
     FlowShowEntityNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GameplayCueNotify,
     GravityFlipUpdateTypeNotify, IllustratedEntry, IllustratedUnlockNotify, InstanceTimer,
     InstanceTimerNotify, InstResultNotify, InstSettleNotify, LeaveSceneNotify,
-    LevelPlayStateNotify, MailInfosNotify, MapMarkShowIdInfoUpdateNotify, ModifyEntityCampNotify,
+    LevelPlayStateNotify, LiftMoveTypeCustomSpeedPb, LiftMoveTypeDefaultPb, LiftMoveTypePb,
+    LiftMoveTypeTeleportPb, MailInfosNotify, MapMarkShowIdInfoUpdateNotify, ModifyEntityCampNotify,
     MovePackageNotify, MoveReplaySample, MoveSplineConfig, MoveSplineConfigEndPointOneof,
     MoveSplineConfigLookDirOneof, MoveSplineConfigStartPointOneof, MoveSplineStatusNotify,
     MovingEntityData, NormalItem, NormalItemUpdateNotify, OccupationPbInfo,
@@ -675,7 +676,7 @@ pub fn execute_action<S: PushSink + ?Sized>(
         | "ChangeLiftTarget"
         | "NpcMoveToPoint"
         | "PlayerMoveToPoint"
-        | "CharacterMoveToPoint" => apply_server_move_action(ctx, name, params)?,
+        | "CharacterMoveToPoint" => apply_server_move_action(ctx, callbacks, name, params)?,
         "VehicleEnter"
         | "VehicleExitPlayer"
         | "VehicleExitNpc"
@@ -5959,8 +5960,66 @@ fn resolve_quest_spline_end_pos(
     Some([base[0] + off[0], base[1] + off[1], base[2] + off[2]])
 }
 
+fn resolve_lift_initial_floor(assets: &Assets, map_id: i32, cfg_id: i32) -> Option<i32> {
+    let lcfg = assets.find_level_entity(map_id, i64::from(cfg_id))?;
+    let mut comps = lcfg.ComponentsData.clone();
+    if let Some(tpl) = assets.find_template_config(&lcfg.BlueprintType) {
+        use sonoro_gamesv_data::tables::entity_components::components::MergeFields;
+        if let Some(tlc) = &tpl.ComponentsData.LiftComponent {
+            match &mut comps.LiftComponent {
+                Some(lc) => lc.merge_fields_from(tlc),
+                None => comps.LiftComponent = Some(tlc.clone()),
+            }
+        }
+    }
+    comps
+        .LiftComponent
+        .filter(|lc| !lc.Disabled.unwrap_or(false))
+        .map(|lc| lc.InitialFloor.unwrap_or(1))
+}
+
+fn parse_lift_move_type(val: Option<&Value>) -> Option<LiftMoveTypePb> {
+    let obj = val?.as_object()?;
+    let ty = json_str(obj.get("Type")).unwrap_or("Default");
+    match ty {
+        "CustomSpeed" => Some(LiftMoveTypePb {
+            Type: Some(LiftMoveType::CustomSpeed),
+            CustomSpeed: Some(LiftMoveTypeCustomSpeedPb {
+                TotalTime: json_float(obj.get("TotalTime")).unwrap_or(0.0),
+                TimePathCurve: json_str(obj.get("TimePathCurve"))
+                    .unwrap_or("")
+                    .as_bytes()
+                    .to_vec(),
+            }),
+            ..Default::default()
+        }),
+        "Teleport" => Some(LiftMoveTypePb {
+            Type: Some(LiftMoveType::Teleport),
+            MoveTeleport: Some(LiftMoveTypeTeleportPb {
+                StartTeleportOffsetDistance: json_float(obj.get("StartTeleportOffsetDistance"))
+                    .unwrap_or(0.0),
+                EndTeleportOffsetDistance: json_float(obj.get("EndTeleportOffsetDistance"))
+                    .unwrap_or(0.0),
+                SendTeleportEvent: json_bool(obj.get("SendTeleportEvent")).unwrap_or(false),
+                TeleportStartEventOffsetDistance: json_float(
+                    obj.get("TeleportStartEventOffsetDistance"),
+                )
+                .unwrap_or(0.0),
+            }),
+            ..Default::default()
+        }),
+        "Default" => Some(LiftMoveTypePb {
+            Type: Some(LiftMoveType::Default),
+            MoveDefault: Some(LiftMoveTypeDefaultPb::default()),
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
 fn apply_server_move_action<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
+    callbacks: &ActionCallbacks<'_, S>,
     name: &str,
     params: &Map<String, Value>,
 ) -> io::Result<()> {
@@ -6129,6 +6188,7 @@ fn apply_server_move_action<S: PushSink + ?Sized>(
         }
         "ChangeLiftTarget" => {
             if let Some(cfg_id) = resolve_action_entity_cfg_id(ctx.scene.as_deref(), params) {
+                let map_id = ctx.assets.resolve_map_config_id(inst_id);
                 let loc = json_int(params.get("Location")).unwrap_or(0);
                 let prev_loc = ctx
                     .scene
@@ -6140,26 +6200,60 @@ fn apply_server_move_action<S: PushSink + ?Sized>(
                     .or_else(|| {
                         let pc = ctx.progress_comp.as_deref()?;
                         let v = pc.info.get_key_int(&format!("lift_target:{cfg_id}"));
-                        (v > 0).then(|| i32::try_from(v).ok()).flatten()
-                    });
+                        if v > 0 {
+                            i32::try_from(v).ok()
+                        } else {
+                            let e = pc.info.get_key_int(&format!("elevator:{cfg_id}"));
+                            (e > 0).then(|| i32::try_from(e).ok()).flatten()
+                        }
+                    })
+                    .or_else(|| resolve_lift_initial_floor(ctx.assets, map_id, cfg_id));
                 record_progress_int(ctx, &format!("lift_target:{cfg_id}"), i64::from(loc), false)?;
                 record_progress_int(ctx, &format!("elevator:{cfg_id}"), i64::from(loc), false)?;
                 ensure_quest_entity_spawned(ctx, cfg_id);
+                let moved = loc > 0 && prev_loc != Some(loc);
+                let move_type = parse_lift_move_type(params.get("MoveType"));
                 if let Some(scene) = ctx.scene.as_deref_mut()
                     && let Some(net_id) = scene.find_entity_net_id_by_config_id(cfg_id)
-                    && let Some(storage) = scene.entity_mut(net_id)
                 {
-                    storage.world_item.lift = Some(LiftComponent { location: loc });
-                    if loc > 0 && prev_loc != Some(loc) {
-                        ctx.sink.push(
-                            ElevatorMoveNotify::MSG_ID,
-                            &ElevatorMoveNotify {
-                                EntityId: net_id,
-                                Location: loc,
-                                MoveType: None,
-                            },
-                        );
+                    let init_pos = scene
+                        .entity(net_id)
+                        .and_then(|s| s.world_item.lift_init_pos);
+                    if let Some(storage) = scene.entity_mut(net_id) {
+                        storage.world_item.lift = Some(LiftComponent { location: loc });
+                        if let Some(base_pos) = init_pos
+                            && let Some(pos) = storage.position.as_mut()
+                        {
+                            pos.location = crate::commands::entity::lift_floor_pos_for_entity(
+                                ctx.assets,
+                                map_id,
+                                cfg_id,
+                                base_pos,
+                                loc,
+                            );
+                        }
+                        if moved {
+                            ctx.sink.push(
+                                ElevatorMoveNotify::MSG_ID,
+                                &ElevatorMoveNotify {
+                                    EntityId: net_id,
+                                    Location: loc,
+                                    MoveType: move_type,
+                                },
+                            );
+                        }
                     }
+                }
+                if moved {
+                    // Manual lifts (!IsAutoMove) only report ElevatorStateChangeRequest::End on
+                    // arrival (GamePlayElevatorComponent.PostMoveToFloor / OnMoveArrived), so
+                    // the server drives the moving state when ChangeLiftTarget starts the ride.
+                    let move_state = if loc > prev_loc.unwrap_or(1) {
+                        "关卡.电梯.上升"
+                    } else {
+                        "关卡.电梯.下降"
+                    };
+                    apply_entity_state_change(ctx, callbacks, cfg_id, move_state)?;
                 }
             }
         }

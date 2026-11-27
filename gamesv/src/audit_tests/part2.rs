@@ -7091,3 +7091,191 @@ fn audit_138_lift_spawns_at_saved_floor_with_base_init_pos() {
         "must not emit spawn-time ElevatorMoveNotify: {lift_moves:?}"
     );
 }
+
+#[test]
+fn audit_139_change_lift_target_drives_rise_fall_and_completes_city_hall_quest() {
+    use sonoro_gamesv_logic::helpers::quest_actions;
+    use sonoro_gamesv_logic::helpers::quest_engine;
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::pb::{
+        ElevatorMoveNotify, ElevatorStateChangeRequest, EntityCommonTagNotify,
+    };
+
+    const LIFT_CFG: i32 = 109_002_461;
+    const CALL_DOWN_UPPER_CFG: i32 = 109_002_850;
+    const CALL_DOWN_LOWER_CFG: i32 = 109_005_469;
+    const QUEST_ID: i32 = 139_000_027;
+    const NODE_ID: i32 = 154;
+
+    let mut h = TestHarness::new("audit139", Some(8));
+    let mut events = EventQueue::new();
+    h.state
+        .player_components
+        .quest
+        .info
+        .get_or_add_active_quest(QUEST_ID)
+        .active_nodes
+        .push(NODE_ID);
+    h.state
+        .player_components
+        .progress
+        .info
+        .set_key_int(&format!("lift_target:{LIFT_CFG}"), 2);
+    h.state
+        .player_components
+        .progress
+        .info
+        .set_key_int(&format!("elevator:{LIFT_CFG}"), 2);
+    h.state.scene.as_mut().unwrap().instance.players = vec![ScenePlayer {
+        id: h.state.player_id,
+        group_type: 1,
+        location: [-31_895.0, 120_726.0, 4_876.0],
+        rotation: [0.0; 3],
+    }];
+    events.enqueue(Event::SpatialSpawnsCheck {
+        player_id: h.state.player_id,
+    });
+    while let Some(ev) = events.dequeue() {
+        let mut rt = h.state.as_runtime(&mut events, None);
+        sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+    }
+    let lift_nid = h
+        .state
+        .scene
+        .as_ref()
+        .unwrap()
+        .find_entity_net_id_by_config_id(LIFT_CFG)
+        .expect("109002461 spawned");
+    let _ = h.drain_count();
+
+    let drain_moves_and_tags = |h: &mut TestHarness| -> (Vec<ElevatorMoveNotify>, Vec<EntityCommonTagNotify>) {
+        let mut moves = Vec::new();
+        let mut tags = Vec::new();
+        while let Ok(frame) = h.rx.try_recv() {
+            if frame.len() < 3 {
+                continue;
+            }
+            if let Ok(msg) = super::Message::decode(&frame[3..]) {
+                if msg.header.message_id() == ElevatorMoveNotify::MSG_ID
+                    && let Ok(mv) = ElevatorMoveNotify::decode(&msg.payload)
+                {
+                    moves.push(mv);
+                } else if msg.header.message_id() == EntityCommonTagNotify::MSG_ID
+                    && let Ok(tg) = EntityCommonTagNotify::decode(&msg.payload)
+                {
+                    tags.push(tg);
+                }
+            }
+        }
+        (moves, tags)
+    };
+
+    let run_change_lift = |h: &mut TestHarness, target: i32| {
+        let mut evq = EventQueue::new();
+        let act = serde_json::json!({
+            "Name": "ChangeLiftTarget",
+            "Params": { "EntityId": LIFT_CFG, "Location": target }
+        });
+        {
+            let mut qctx = h.state.quest_context(&mut evq);
+            let mut cbs = quest_engine::action_callbacks();
+            quest_actions::execute_action(&mut qctx, &mut cbs, CALL_DOWN_LOWER_CFG, 0, &act)
+                .expect("ChangeLiftTarget");
+        }
+        while let Some(ev) = evq.dequeue() {
+            let mut rt = h.state.as_runtime(&mut evq, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("dispatch");
+        }
+    };
+
+    // 1. Call elevator down from saved floor 2 to floor 1.
+    run_change_lift(&mut h, 1);
+    let (moves, tags) = drain_moves_and_tags(&mut h);
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].EntityId, lift_nid);
+    assert_eq!(moves[0].Location, 1);
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.下降")
+    );
+    assert!(
+        tags.iter().any(|t| t.Id == lift_nid),
+        "expected EntityCommonTagNotify for 109002461 moving down"
+    );
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(CALL_DOWN_LOWER_CFG)),
+        Some("关卡.Common.状态.激活")
+    );
+    assert!(!h.state.player_components.quest.info.has_finished_child_quest(QUEST_ID, NODE_ID));
+
+    // 2. Client arrives at floor 1 with proto3 default State = None (End).
+    let resp = world_puzzle::handle_elevator_state_change_request(
+        &mut h.state,
+        ElevatorStateChangeRequest {
+            EntityId: lift_nid,
+            State: None,
+            TagState: 1,
+        },
+    )
+    .expect("arrival floor 1");
+    assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    let (moves, tags) = drain_moves_and_tags(&mut h);
+    assert!(moves.is_empty(), "arrival must not echo ElevatorMoveNotify");
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.停靠")
+    );
+    assert!(
+        tags.iter().any(|t| t.Id == lift_nid),
+        "expected EntityCommonTagNotify restoring 关卡.电梯.停靠 on arrival"
+    );
+
+    // 3. Player clicks Subir to go from floor 1 to floor 2 (client does NOT send Forward).
+    run_change_lift(&mut h, 2);
+    let (moves, tags) = drain_moves_and_tags(&mut h);
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].EntityId, lift_nid);
+    assert_eq!(moves[0].Location, 2);
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.上升")
+    );
+    assert!(
+        tags.iter().any(|t| t.Id == lift_nid),
+        "expected EntityCommonTagNotify for 109002461 moving up"
+    );
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(CALL_DOWN_UPPER_CFG)),
+        Some("关卡.Common.状态.激活")
+    );
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(CALL_DOWN_LOWER_CFG)),
+        Some("关卡.Common.状态.常态")
+    );
+    assert!(
+        h.state.player_components.quest.info.has_finished_child_quest(QUEST_ID, NODE_ID),
+        "ChangeLiftTarget 1 -> 2 must advance quest {QUEST_ID} node {NODE_ID}"
+    );
+
+    // 4. Client arrives at floor 2 with State = None (End).
+    let resp = world_puzzle::handle_elevator_state_change_request(
+        &mut h.state,
+        ElevatorStateChangeRequest {
+            EntityId: lift_nid,
+            State: None,
+            TagState: 2,
+        },
+    )
+    .expect("arrival floor 2");
+    assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    let (moves, tags) = drain_moves_and_tags(&mut h);
+    assert!(moves.is_empty(), "arrival must not echo ElevatorMoveNotify");
+    assert_eq!(
+        h.state.player_components.quest.info.get_entity_state(i64::from(LIFT_CFG)),
+        Some("关卡.电梯.停靠")
+    );
+    assert!(
+        tags.iter().any(|t| t.Id == lift_nid),
+        "expected EntityCommonTagNotify restoring 关卡.电梯.停靠 on floor 2 arrival"
+    );
+}
