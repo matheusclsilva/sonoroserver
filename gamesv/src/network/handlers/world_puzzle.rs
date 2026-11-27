@@ -2298,7 +2298,7 @@ fn resolve_and_grant_entity_collect_or_capture(
             let _ = reward::grant_treasure_box_reward(&mut rctx, tb_type, reward_id, 7000)
                 .map_err(|e| e.to_string())?;
         } else if reward_id > 0 {
-            let res = reward::grant_drop_package(&mut rctx, reward_id, 1)
+            let res = reward::grant_world_pickup_drop_package(&mut rctx, reward_id, 1)
                 .map_err(|e| e.to_string())?;
             if res.granted_count == 0 {
                 reward::grant_items(
@@ -3135,7 +3135,7 @@ pub fn handle_pick_up_drop_item_request(
                         .map_err(|e| e.to_string())?;
                     granted_any = res.granted_count > 0;
                 } else if reward_id > 0 {
-                    let res = reward::grant_drop_package(&mut rctx, reward_id, 1)
+                    let res = reward::grant_world_pickup_drop_package(&mut rctx, reward_id, 1)
                         .map_err(|e| e.to_string())?;
                     granted_any = res.granted_count > 0;
                 }

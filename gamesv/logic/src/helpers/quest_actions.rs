@@ -4397,7 +4397,7 @@ fn apply_interact_collect_or_reward<S: PushSink + ?Sized>(
             let _ = reward::grant_treasure_box_reward(&mut rctx, tb_type, reward_id, 7000)?;
         } else if reward_id > 0 {
             let mut rctx = ctx.make_reward_context();
-            let res = reward::grant_drop_package(&mut rctx, reward_id, 1)?;
+            let res = reward::grant_world_pickup_drop_package(&mut rctx, reward_id, 1)?;
             if res.granted_count == 0 && is_collect {
                 let fallback = [RewardItem {
                     item_id: 2,

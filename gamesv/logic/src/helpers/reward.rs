@@ -51,7 +51,7 @@ pub fn grant_drop_package<S: PushSink + ?Sized>(
     drop_id: i32,
     reason: i32,
 ) -> io::Result<GrantResult> {
-    grant_drop_package_internal(ctx, drop_id, reason, None)
+    grant_drop_package_internal(ctx, drop_id, reason, None, false)
 }
 
 pub fn grant_drop_package_popup<S: PushSink + ?Sized>(
@@ -59,7 +59,20 @@ pub fn grant_drop_package_popup<S: PushSink + ?Sized>(
     drop_id: i32,
     reason: i32,
 ) -> io::Result<GrantResult> {
-    grant_drop_package_internal(ctx, drop_id, reason, Some(true))
+    grant_drop_package_internal(ctx, drop_id, reason, Some(true), false)
+}
+
+/// A drop the player takes from the world: a gathered plant, a collected item or a broken
+/// rock or crate. These packages have `ShowBg` false, so the client's
+/// `ItemHintController.HandleItemRewardNotify` shows nothing for them, and the item hint
+/// comes only from `NormalItemAddNotify` / `NormalItemUpdateNotify` with `NoTips` false
+/// (`InventoryController`). The popup still follows `ShowBg`.
+pub fn grant_world_pickup_drop_package<S: PushSink + ?Sized>(
+    ctx: &mut RewardContext<'_, S>,
+    drop_id: i32,
+    reason: i32,
+) -> io::Result<GrantResult> {
+    grant_drop_package_internal(ctx, drop_id, reason, None, true)
 }
 
 fn chest_drop_override_items(drop_id: i32) -> Option<&'static [RewardItem]> {
@@ -207,6 +220,7 @@ fn grant_drop_package_internal<S: PushSink + ?Sized>(
     drop_id: i32,
     reason: i32,
     force_popup: Option<bool>,
+    item_tips: bool,
 ) -> io::Result<GrantResult> {
     if drop_id <= 0 {
         return Ok(GrantResult::default());
@@ -222,7 +236,15 @@ fn grant_drop_package_internal<S: PushSink + ?Sized>(
         .drop_package
         .get_data_by_id(&drop_id)
         .is_none_or(|pkg| pkg.ShowBg);
-    grant_items(ctx, drop_id, force_popup.unwrap_or(show_bg), &grants, reason)
+    let show_popup = force_popup.unwrap_or(show_bg);
+    grant_items_with_tips(
+        ctx,
+        drop_id,
+        show_popup,
+        show_popup || item_tips,
+        &grants,
+        reason,
+    )
 }
 
 pub fn grant_treasure_box_reward<S: PushSink + ?Sized>(
@@ -398,6 +420,19 @@ pub fn grant_items<S: PushSink + ?Sized>(
     ctx: &mut RewardContext<'_, S>,
     drop_id: i32,
     show_popup: bool,
+    items: &[RewardItem],
+    reason: i32,
+) -> io::Result<GrantResult> {
+    grant_items_with_tips(ctx, drop_id, show_popup, show_popup, items, reason)
+}
+
+/// `show_popup` sends `ItemRewardNotify`; `show_tips` clears `NoTips` on the item
+/// add/update notifies, which is what makes the client list the items in its hint panel.
+fn grant_items_with_tips<S: PushSink + ?Sized>(
+    ctx: &mut RewardContext<'_, S>,
+    drop_id: i32,
+    show_popup: bool,
+    show_tips: bool,
     items: &[RewardItem],
     reason: i32,
 ) -> io::Result<GrantResult> {
@@ -717,7 +752,7 @@ pub fn grant_items<S: PushSink + ?Sized>(
             NormalItemAddNotify::MSG_ID,
             &NormalItemAddNotify {
                 NormalItemList: add_normal_list,
-                NoTips: !show_popup,
+                NoTips: !show_tips,
                 Reason: reason,
             },
         );
@@ -727,7 +762,7 @@ pub fn grant_items<S: PushSink + ?Sized>(
             NormalItemUpdateNotify::MSG_ID,
             &NormalItemUpdateNotify {
                 NormalItemList: upd_normal_list,
-                NoTips: !show_popup,
+                NoTips: !show_tips,
             },
         );
     }

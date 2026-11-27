@@ -2788,7 +2788,11 @@ pub fn on_entity_interact_fallback<S: PushSink + ?Sized>(
                 .and_then(|rc| rc.RewardId)
                 .unwrap_or(0);
             if reward_id > 0 {
-                let res = reward::grant_drop_package(&mut ctx.as_reward_ctx(), reward_id, 1)?;
+                let res = reward::grant_world_pickup_drop_package(
+                    &mut ctx.as_reward_ctx(),
+                    reward_id,
+                    1,
+                )?;
                 if res.granted_count == 0 {
                     let items = [RewardItem {
                         item_id: 2,
@@ -2885,7 +2889,7 @@ pub fn on_animal_drop<S: PushSink + ?Sized>(
         .unwrap_or(0);
 
     let res = if reward_id > 0 {
-        reward::grant_drop_package(&mut ctx.as_reward_ctx(), reward_id, 1)?
+        reward::grant_world_pickup_drop_package(&mut ctx.as_reward_ctx(), reward_id, 1)?
     } else {
         Default::default()
     };

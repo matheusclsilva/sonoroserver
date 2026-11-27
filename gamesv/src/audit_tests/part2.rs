@@ -8805,3 +8805,96 @@ fn audit_148_prologue_story_role_drops_unlock_and_join_formation() {
         .collect();
     assert_eq!(legacy_ids, vec![1501, 1402]);
 }
+
+#[test]
+fn audit_149_world_collect_drop_shows_item_hint_without_popup() {
+    use sonoro_proto::pb::{EntityInteractRequest, NormalItemAddNotify, NormalItemUpdateNotify};
+
+    // Collect106 102001084: InteractComponent option `Collect`, RewardComponent 2506
+    // (RewardType Collect). DropPackage 2506 has ShowBg false and DropPreview {42310060: 1}.
+    const PLANT_CFG: i32 = 102_001_084;
+    const PLANT_DROP: i32 = 2506;
+    const PLANT_ITEM: i32 = 42_310_060;
+
+    fn drain_raw(h: &mut TestHarness) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = h.rx.try_recv() {
+            if frame.len() >= 3
+                && let Ok(msg) = super::Message::decode(&frame[3..])
+            {
+                out.push((msg.header.message_id(), msg.payload));
+            }
+        }
+        out
+    }
+    fn of<M: sonoro_proto::PbMessage>(frames: &[(u16, Vec<u8>)], msg_id: u16) -> Vec<M> {
+        frames
+            .iter()
+            .filter(|(id, _)| *id == msg_id)
+            .filter_map(|(_, payload)| M::decode(payload).ok())
+            .collect()
+    }
+
+    let mut h = TestHarness::new("audit149", Some(8));
+    let mut events = EventQueue::new();
+    let plant_nid = {
+        let mut s = EntityComponentStorage::new(
+            0,
+            ConfigComponent {
+                camp: 2,
+                config_id: PLANT_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::SceneItem,
+                state: EntityState::Default,
+            },
+        );
+        s.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        h.state.scene.as_mut().unwrap().spawn(s).net_id
+    };
+    let _ = h.drain_count();
+
+    // 1. Gathering adds the item with NoTips false (InventoryController lists it in the item
+    //    hint only then) and sends no ItemRewardNotify, because the package has ShowBg false.
+    let resp = scene::handle_entity_interact_request(
+        &mut h.state,
+        &mut events,
+        EntityInteractRequest {
+            EntityId: plant_nid,
+            OptionIndex: 0,
+            ..Default::default()
+        },
+    )
+    .expect("gather plant");
+    assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    let frames = drain_raw(&mut h);
+    let adds: Vec<NormalItemAddNotify> = of(&frames, NormalItemAddNotify::MSG_ID);
+    let plant_add = adds
+        .iter()
+        .find(|n| n.NormalItemList.iter().any(|it| it.Id == PLANT_ITEM))
+        .expect("gathering must add the DropPreview item");
+    assert!(
+        !plant_add.NoTips,
+        "a gathered item must reach the client's item hint (NoTips false)"
+    );
+    assert!(
+        of::<ItemRewardNotify>(&frames, ItemRewardNotify::MSG_ID).is_empty(),
+        "ShowBg false: no reward popup for a gathered plant"
+    );
+
+    // 2. Other DropPackage grants keep their previous NoTips: only world pickups changed.
+    {
+        let mut rctx = h.state.reward_context();
+        reward::grant_drop_package(&mut rctx, PLANT_DROP, 1).expect("plain drop package");
+    }
+    let frames = drain_raw(&mut h);
+    let updates: Vec<NormalItemUpdateNotify> = of(&frames, NormalItemUpdateNotify::MSG_ID);
+    assert!(
+        updates
+            .iter()
+            .any(|n| n.NoTips && n.NormalItemList.iter().any(|it| it.Id == PLANT_ITEM)),
+        "grant_drop_package without the world-pickup path keeps NoTips true"
+    );
+}
