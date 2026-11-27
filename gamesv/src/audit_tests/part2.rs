@@ -7431,4 +7431,34 @@ fn audit_140_open_system_board_with_return_notifies_client_and_records_result_on
         vars[0].VarDefine.as_ref().and_then(|d| d.Value.as_ref()),
         Some(&VarDefinePbValueOneof::Int(1))
     );
+
+    // 4. Score is a variable reference in the data (here a Constant, as in some
+    //    SoaringChallenge rows), and InfrastructureItemDelivery's DeliveryType is an object
+    //    {"Type": "RoadBuild", "Id": 1} (EInfrastructureItemDeliveryType).
+    use sonoro_proto::enums::ActionInfrastructureItemDeliveryType;
+    for system_type in [
+        serde_json::json!({"Type": "SoaringChallenge",
+            "Score": {"Type": "Int", "Source": "Constant", "Value": 500},
+            "RankS": 500, "RankA": 300, "RankB": 100,
+            "ReturnVar": {"Type": "Int", "Source": "Self", "Name": "Value1"}}),
+        serde_json::json!({"Type": "InfrastructureItemDelivery",
+            "DeliveryType": {"Type": "RoadBuild", "Id": 1},
+            "ReturnVar": {"Type": "Int", "Source": "Self", "Name": "Complete"}}),
+    ] {
+        let mut evq = EventQueue::new();
+        let act = serde_json::json!({"Name": "OpenSystemBoardWithReturn", "Params": {"SystemType": system_type}});
+        {
+            let mut qctx = h.state.quest_context(&mut evq);
+            let mut cbs = quest_engine::action_callbacks();
+            quest_actions::execute_action(&mut qctx, &mut cbs, QUEST_ID, 1, &act)
+                .expect("OpenSystemBoardWithReturn");
+        }
+    }
+    let (boards, _) = drain_board_and_vars(&mut h);
+    assert_eq!(boards.len(), 2);
+    let soaring = boards[0].Param.as_ref().and_then(|p| p.SoaringChallengeData.as_ref()).expect("soaring");
+    assert_eq!((soaring.Score, soaring.RankS), (500, 500));
+    let infr = boards[1].Param.as_ref().and_then(|p| p.InfrHandInData.as_ref()).expect("infr");
+    assert_eq!(infr.Type, Some(ActionInfrastructureItemDeliveryType::Road));
+    assert_eq!(infr.Id, 1);
 }

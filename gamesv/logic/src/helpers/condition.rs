@@ -3975,6 +3975,11 @@ fn resolve_var_float(ctx: &EvalContext<'_>, var_opt: Option<&Value>) -> f64 {
     }
 }
 
+/// Integer value of a level-data variable reference (`{"Type","Source","Name"|"Value"...}`).
+pub fn resolve_int_var(ctx: &EvalContext<'_>, var_opt: Option<&Value>) -> i32 {
+    resolve_var_value(ctx, var_opt)
+}
+
 fn resolve_var_value(ctx: &EvalContext<'_>, var_opt: Option<&Value>) -> i32 {
     let Some(v) = var_opt.and_then(Value::as_object) else {
         return 0;

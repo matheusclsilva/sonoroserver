@@ -3665,6 +3665,18 @@ fn apply_open_system_board_with_return<S: PushSink + ?Sized>(
         IncId: inc_id,
         ..Default::default()
     };
+    // Score is a variable reference in the data ({"Type":"Int","Source":"Self","Name":...}),
+    // not a number.
+    let board_int = |ctx: &QuestContext<'_, S>, v: Option<&Value>| -> i32 {
+        match v {
+            Some(Value::Object(_)) => {
+                let mut eval_ctx = ctx.make_eval_context();
+                eval_ctx.self_entity_config_id = owner_id;
+                crate::helpers::condition::resolve_int_var(&eval_ctx, v)
+            }
+            other => json_int(other).unwrap_or(0),
+        }
+    };
     match st_type {
         "ConfirmBox" | "ConfirmBox2" => {
             let board_id = json_int(st.get("Id")).unwrap_or(0);
@@ -3675,7 +3687,7 @@ fn apply_open_system_board_with_return<S: PushSink + ?Sized>(
         "SoaringChallenge" => {
             param.ActionOpenType = Some(ActionOpenSystemType::SoaringChallenge);
             param.SoaringChallengeData = Some(SoaringChallengeData {
-                Score: json_int(st.get("Score")).unwrap_or(0),
+                Score: board_int(ctx, st.get("Score")),
                 RankS: json_int(st.get("RankS")).unwrap_or(0),
                 RankA: json_int(st.get("RankA")).unwrap_or(0),
                 RankB: json_int(st.get("RankB")).unwrap_or(0),
@@ -3694,20 +3706,26 @@ fn apply_open_system_board_with_return<S: PushSink + ?Sized>(
             });
         }
         "InfrastructureItemDelivery" => {
-            let delivery_ty = match json_str(st.get("DeliveryType")) {
-                Some("Road") => ActionInfrastructureItemDeliveryType::Road,
+            // DeliveryType is {"Type": "Observatory" | "RoadBuild", "Id": n}
+            // (Aki.TDConfigMgr EInfrastructureItemDeliveryType).
+            let delivery = st.get("DeliveryType").and_then(Value::as_object);
+            let delivery_ty = match delivery.and_then(|d| json_str(d.get("Type"))) {
+                Some("RoadBuild") | Some("Road") => ActionInfrastructureItemDeliveryType::Road,
                 _ => ActionInfrastructureItemDeliveryType::Observatory,
             };
             param.ActionOpenType = Some(ActionOpenSystemType::InfrHandIn);
             param.InfrHandInData = Some(InfrHandInData {
                 Type: Some(delivery_ty),
-                Id: json_int(st.get("Id")).unwrap_or(0),
+                Id: delivery
+                    .and_then(|d| json_int(d.get("Id")))
+                    .or_else(|| json_int(st.get("Id")))
+                    .unwrap_or(0),
             });
         }
         "MotorRaceChallenge" => {
             param.ActionOpenType = Some(ActionOpenSystemType::MotorRaceChallenge);
             param.MotorRaceChallengeData = Some(MotorRaceChallengeData {
-                Score: json_int(st.get("Score")).unwrap_or(0),
+                Score: board_int(ctx, st.get("Score")),
                 RankS: json_int(st.get("RankS")).unwrap_or(0),
                 RankA: json_int(st.get("RankA")).unwrap_or(0),
                 RankB: json_int(st.get("RankB")).unwrap_or(0),
