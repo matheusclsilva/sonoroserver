@@ -12,17 +12,17 @@ use sonoro_gamesv_fs::last_scene_info::LastSceneInfo;
 use sonoro_gamesv_fs::quest_info::{QuestInfo, append_unique_int, append_unique_str, remove_int_value, remove_str_value};
 use sonoro_proto::enums::{
     ActionInfrastructureItemDeliveryType, ActionOpenSystemType, BtType, ChangeReason,
-    ERemoveEntityType, ExitVehicleType, GameCtxType, GravityFlipType, IllustratedType,
-    LiftMoveType, MoveStatus, SuspendType, TeleportReason,
+    EPlayerFollower, ERemoveEntityType, ESummonType, ExitVehicleType, FollowerType, GameCtxType,
+    GravityFlipType, IllustratedType, LiftMoveType, MoveStatus, SuspendType, TeleportReason,
 };
 use sonoro_proto::pb::{
     ActionOpenSystemBoardNotify, ActionOpenSystemParam, AddGuestNotify, AlertArea, AlertAreaNotify,
     AudioStatePb, AudioStateUpdateNotify, BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify,
     CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify,
-    EntityAddDynamicInteractNotify, EntityCommonTagNotify, EntityCtxPb, EntityPosResetNotify,
-    EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo,
-    EntityRemoveNotify, EntityStateReadyNotify, FishingHandInData, FlowActionCtxPb,
-    FlowShowEntityNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GameplayCueNotify,
+    EntityAddDynamicInteractNotify, EntityAddNotify, EntityCommonTagNotify, EntityCtxPb,
+    EntityPosResetNotify, EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify,
+    EntityRemoveInfo, EntityRemoveNotify, EntityStateReadyNotify, FishingHandInData,
+    FlowActionCtxPb, FlowShowEntityNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GameplayCueNotify,
     GiantSystemBoardData, GravityFlipUpdateTypeNotify, GreatSwordChallengeData, IllustratedEntry,
     IllustratedUnlockNotify, InfrHandInData, InstanceTimer, InstanceTimerNotify, InstResultNotify,
     InstSettleNotify, LeaveSceneNotify, LevelPlayStateNotify, LiftMoveTypeCustomSpeedPb,
@@ -31,22 +31,29 @@ use sonoro_proto::pb::{
     MovePackageNotify, MoveReplaySample, MoveSplineConfig, MoveSplineConfigEndPointOneof,
     MoveSplineConfigLookDirOneof, MoveSplineConfigStartPointOneof, MoveSplineStatusNotify,
     MovingEntityData, NormalItem, NormalItemUpdateNotify, OccupationPbInfo, OpenSystemBoardData,
-    OperationRestrictionNotify, PlayerReviveNotify, PlayerVarNotify, RemoveGuestNotify,
-    RoleTrialCloseNotify, RoleTrialOpenNotify, Rotator, RoverRogueRoomInfoNotify, SceneAreaState,
-    SceneAreaStateNotify, SceneChangeDataLayerNotify, SceneItemMoveTargetInfo,
-    SceneItemMoveTargetNotify, SceneItemSplineRuntimeData, SceneSubLevelsChangedNotify,
-    SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify, SoaringChallengeData,
-    StateChangeActionCtxPb, SummonEntityNotify, SyncSceneTimeNotify, TeleportNotify,
-    TeleportUpdateNotify, TemporaryTeleportAllInfoNotify, TimeLockInfoNotify, TrialRoleItem,
-    VarDefinePb, VarDefinePbValueOneof, Vector, VehicleUpdateEntityNotify, VehicleUpdateNotify,
-    WeatherNotify,
+    OperationRestrictionNotify, PlayerFollowerNotify, PlayerFollowerPb, PlayerReviveNotify,
+    PlayerVarNotify, RemoveGuestNotify, RoleTrialCloseNotify, RoleTrialOpenNotify, Rotator,
+    RoverRogueRoomInfoNotify, SceneAreaState, SceneAreaStateNotify, SceneChangeDataLayerNotify,
+    SceneItemMoveTargetInfo, SceneItemMoveTargetNotify, SceneItemSplineRuntimeData,
+    SceneSubLevelsChangedNotify, SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify,
+    SoaringChallengeData, StateChangeActionCtxPb, SummonEntityNotify, SyncSceneTimeNotify,
+    TeleportNotify, TeleportUpdateNotify, TemporaryTeleportAllInfoNotify, TimeLockInfoNotify,
+    TrialRoleItem, VarDefinePb, VarDefinePbValueOneof, Vector, VehicleUpdateEntityNotify,
+    VehicleUpdateNotify, WeatherNotify,
 };
 use sonoro_proto::wire::PbEnum;
 
 use crate::commands::js_patches;
 use crate::component::comp_util;
-use crate::component::entity::small::{EntityState, EntityType, LiftComponent, MoveSplineComponent};
+use crate::component::entity::small::{
+    CharacterAttachComponent, ConfigComponent, ConfigType, EntityState, EntityType, EquipComponent,
+    FollowShooterComponent, LiftComponent, MonsterAiComponent, MoveSplineComponent,
+    PositionComponent, SummonerComponent,
+};
 use crate::component::entity::tag::TagComponent;
+use crate::component::entity::{
+    AttributeComponent, EntityComponentStorage, FightBuffComponent, LogicStateComponent,
+};
 use crate::component::player::PlayerProgressComponent;
 use crate::events::{BuffAdditionEntry, Event};
 use crate::fsm::types::wake_reason;
@@ -393,8 +400,12 @@ pub fn execute_action<S: PushSink + ?Sized>(
         "AddTrialFollowShooter" => {
             let sid = i64::from(json_int(params.get("Id")).unwrap_or(0));
             record_progress_int(ctx, "trial:follow_shooter", sid, false)?;
+            apply_add_trial_follow_shooter(ctx, sid);
         }
-        "RemoveTrialFollowShooter" => record_progress_int(ctx, "trial:follow_shooter", 0, false)?,
+        "RemoveTrialFollowShooter" => {
+            record_progress_int(ctx, "trial:follow_shooter", 0, false)?;
+            apply_remove_trial_follow_shooter(ctx);
+        }
         "ChangeTeamPosition" => {
             if let Some(pid) = json_int(params.get("PositionId")) {
                 record_progress_int(ctx, "team:pos_id", i64::from(pid), false)?;
@@ -6999,6 +7010,186 @@ fn vehicle_has_other_occupants<S: PushSink + ?Sized>(
         }
     }
     false
+}
+
+fn set_auxiliary_follower_entry(scene: &mut Scene, entity_id: i64) {
+    let aux_kind = FollowerType::EPlayerFollowerAuxiliary.to_i32();
+    for entity in &mut scene.entities {
+        if entity.config.entity_type != EntityType::PlayerEntity {
+            continue;
+        }
+        let Some(follower) = entity.follower.as_mut() else {
+            continue;
+        };
+        if let Some(entry) = follower.list.iter_mut().find(|entry| entry.kind == aux_kind) {
+            entry.entity_id = entity_id;
+        } else {
+            follower.list.push(crate::component::entity::small::FollowerEntry {
+                kind: aux_kind,
+                entity_id,
+            });
+        }
+    }
+}
+
+fn apply_remove_trial_follow_shooter<S: PushSink + ?Sized>(ctx: &mut QuestContext<'_, S>) {
+    let Some(scene) = ctx.scene.as_deref_mut() else {
+        return;
+    };
+    let Some(net_id) = scene.trial_follow_shooter_net_id.take() else {
+        return;
+    };
+    set_auxiliary_follower_entry(scene, 0);
+    let player_id = scene.player_id;
+    ctx.sink.push(
+        PlayerFollowerNotify::MSG_ID,
+        &PlayerFollowerNotify {
+            PlayerId: player_id,
+            ListPlayerFollowerPb: vec![PlayerFollowerPb {
+                Type: Some(EPlayerFollower::Auxiliary),
+                EntityId: 0,
+            }],
+        },
+    );
+    let _ = scene.remove(ctx.fs, net_id);
+    ctx.sink.push(
+        EntityRemoveNotify::MSG_ID,
+        &EntityRemoveNotify {
+            IsRemove: true,
+            RemoveInfos: vec![EntityRemoveInfo {
+                EntityId: net_id,
+                Type: Some(ERemoveEntityType::RemoveTypeNormal),
+            }],
+        },
+    );
+}
+
+fn apply_add_trial_follow_shooter<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    summon_cfg_id: i64,
+) {
+    let Ok(cfg_id) = i32::try_from(summon_cfg_id) else {
+        return;
+    };
+    if cfg_id <= 0 {
+        return;
+    }
+    let Some(summon_cfg) = ctx
+        .assets
+        .tables
+        .summon_cfg
+        .get_data_by_id(&cfg_id)
+        .map(|cfg| cfg.into_owned())
+    else {
+        return;
+    };
+    let Some(template_config) = ctx.assets.find_template_config(&summon_cfg.BlueprintType) else {
+        return;
+    };
+
+    apply_remove_trial_follow_shooter(ctx);
+
+    let Some(scene) = ctx.scene.as_deref_mut() else {
+        return;
+    };
+    let player_entity_id = scene
+        .entities
+        .iter()
+        .find(|e| e.config.entity_type == EntityType::PlayerEntity)
+        .map_or(0, |e| e.net_id);
+    let (location, rotation) = if let Some(first) = scene.instance.players.first() {
+        (first.location, first.rotation)
+    } else {
+        ([0.0; 3], [0.0; 3])
+    };
+
+    let attr_comp = template_config
+        .ComponentsData
+        .AttributeComponent
+        .as_ref()
+        .and_then(|attr| attr.PropertyId)
+        .filter(|&pid| pid > 0)
+        .map(|pid| AttributeComponent::create(&ctx.assets.tables.get_props(pid)))
+        .unwrap_or_default();
+
+    let mut storage = EntityComponentStorage::new(
+        0,
+        ConfigComponent {
+            camp: 0,
+            state: EntityState::Default,
+            entity_type: EntityType::Monster,
+            config_type: ConfigType::Template,
+            config_id: template_config.Id,
+        },
+    );
+    storage.player_id = Some(scene.player_id);
+    storage.position = Some(PositionComponent { location, rotation });
+    storage.actor_visible = true;
+    storage.visible = true;
+    storage.buffs = Some(FightBuffComponent::default());
+    storage.attribute = Some(attr_comp);
+    storage.summoner = Some(SummonerComponent {
+        player_id: scene.player_id,
+        summon_cfg_id: summon_cfg.Id,
+        summon_skill_id: 0,
+        summon_type: ESummonType::ConcomitantCustom,
+        summoner_id: player_entity_id,
+    });
+    storage.follow_shooter = Some(FollowShooterComponent {
+        player_entity_id,
+        summon_config_id: summon_cfg.Id,
+    });
+    storage.logic_state = Some(LogicStateComponent::default());
+    storage.monster_ai = Some(MonsterAiComponent {
+        ai_team_init_id: 0,
+        combat_message_id: 1,
+        hatred_group_id: 0,
+        weapon_id: 0,
+        ..Default::default()
+    });
+    storage.equip = Some(EquipComponent::default());
+    storage.character_attach = Some(CharacterAttachComponent::default());
+
+    let entity = scene.spawn(storage);
+    let born_buffs: Vec<BuffAdditionEntry> =
+        sonoro_gamesv_data::tables::buff::buff_list_from_ids(&summon_cfg.BornBuffId)
+            .into_iter()
+            .map(|b| BuffAdditionEntry {
+                id: b.id,
+                stack_count: b.stack_count,
+                is_active: b.is_active,
+                ..Default::default()
+            })
+            .collect();
+    if !born_buffs.is_empty() {
+        let infos = scene.build_fight_buff_infos(&born_buffs, entity.net_id);
+        if let Some(buffs) = scene.entities[entity.index].buffs.as_mut() {
+            buffs.buffs = infos;
+        }
+    }
+
+    scene.trial_follow_shooter_net_id = Some(entity.net_id);
+    set_auxiliary_follower_entry(scene, entity.net_id);
+
+    let pb = scene.entities[entity.index].to_proto(ctx.assets, now_millis());
+    let player_id = scene.player_id;
+    ctx.sink.push(
+        EntityAddNotify::MSG_ID,
+        &EntityAddNotify {
+            RemoveTagIds: false,
+            EntityPbs: vec![pb],
+        },
+    );
+    ctx.sink.push(
+        PlayerFollowerNotify::MSG_ID,
+        &PlayerFollowerNotify {
+            PlayerId: player_id,
+            ListPlayerFollowerPb: vec![PlayerFollowerPb {
+                Type: Some(EPlayerFollower::Auxiliary),
+                EntityId: entity.net_id,
+            }],
+        },
+    );
 }
 
 #[cfg(test)]

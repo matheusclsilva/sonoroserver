@@ -7920,3 +7920,219 @@ fn audit_144_range_limiting_pushes_warning_and_cancel_notifies() {
     assert_eq!(cancels.len(), 1);
     assert_eq!(cancels[0].TreeIncId, i64::from(QUEST_ID));
 }
+
+#[test]
+fn audit_145_trial_follow_shooter_spawns_entity_and_pushes_player_follower_notify() {
+    use super::Message;
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::enums::{EPlayerFollower, FollowerType};
+    use sonoro_proto::pb::{
+        EntityRemoveNotify, PlayerFollowerNotify,
+    };
+
+    let mut h = TestHarness::new("audit145", Some(8));
+    let assets = h.state.assets.clone();
+    let player_entity = sonoro_gamesv_logic::templates::player_entity_templates::create_player_scene_entity(
+        h.state.scene.as_mut().expect("scene"),
+        1,
+        &assets,
+        0,
+    );
+    let _ = h.drain_count();
+
+    const SUMMON_CFG_ID: i32 = 24_000_024;
+    let summon_cfg = h
+        .state
+        .assets
+        .tables
+        .summon_cfg
+        .get_data_by_id(&SUMMON_CFG_ID)
+        .expect("SummonCfg 24000024 in assets");
+    let expected_tpl = h
+        .state
+        .assets
+        .find_template_config(&summon_cfg.BlueprintType)
+        .expect("TemplateConfig for 24000024")
+        .Id;
+
+    // 1. AddTrialFollowShooter spawns monster with FollowShooterComponent + SummonerComponent
+    //    and pushes EntityAddNotify BEFORE PlayerFollowerNotify(Auxiliary, net_id).
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        let mut cbs = ActionCallbacks::default();
+        let act = serde_json::json!({
+            "Name": "AddTrialFollowShooter",
+            "Params": { "Id": SUMMON_CFG_ID }
+        });
+        execute_action(&mut qctx, &mut cbs, 151_000_000, 1, &act).expect("AddTrialFollowShooter");
+    }
+
+    let spawned_net_id = h
+        .state
+        .scene
+        .as_ref()
+        .expect("scene")
+        .trial_follow_shooter_net_id
+        .expect("trial_follow_shooter_net_id set");
+    assert!(spawned_net_id > 0);
+    assert_eq!(
+        h.state
+            .player_components
+            .progress
+            .info
+            .get_key_int("trial:follow_shooter"),
+        i64::from(SUMMON_CFG_ID)
+    );
+
+    let mut add_seq = Vec::new();
+    let mut added_entity_pb = None;
+    let mut add_follower_notify = None;
+    while let Ok(frame) = h.rx.try_recv() {
+        if frame.len() < 3 {
+            continue;
+        }
+        let Ok(msg) = Message::decode(&frame[3..]) else {
+            continue;
+        };
+        let msg_id = msg.header.message_id();
+        if msg_id == EntityAddNotify::MSG_ID {
+            add_seq.push(msg_id);
+            let n = EntityAddNotify::decode(&msg.payload).expect("decode EntityAddNotify");
+            added_entity_pb = n.EntityPbs.into_iter().next();
+        } else if msg_id == PlayerFollowerNotify::MSG_ID {
+            add_seq.push(msg_id);
+            add_follower_notify = Some(
+                PlayerFollowerNotify::decode(&msg.payload).expect("decode PlayerFollowerNotify"),
+            );
+        }
+    }
+    assert_eq!(
+        add_seq,
+        vec![EntityAddNotify::MSG_ID, PlayerFollowerNotify::MSG_ID],
+        "EntityAddNotify must precede PlayerFollowerNotify"
+    );
+
+    let pb = added_entity_pb.expect("spawned EntityPb");
+    assert_eq!(pb.Id, spawned_net_id);
+    assert_eq!(pb.ConfigId, expected_tpl);
+    let mut has_follow_shooter = false;
+    let mut has_summoner = false;
+    for comp in &pb.ComponentPbs {
+        match &comp.ComponentPb {
+            Some(EntityComponentPbComponentPbOneof::FollowShooterComponentPb(fs)) => {
+                has_follow_shooter = true;
+                assert_eq!(fs.PlayerEntityId, player_entity.net_id);
+                assert_eq!(fs.SummonConfigId, SUMMON_CFG_ID);
+            }
+            Some(EntityComponentPbComponentPbOneof::SummonerComponent(sc)) => {
+                has_summoner = true;
+                assert_eq!(sc.SummonCfgId, SUMMON_CFG_ID);
+                assert_eq!(sc.SummonerId, player_entity.net_id);
+            }
+            _ => {}
+        }
+    }
+    assert!(has_follow_shooter, "spawned entity missing FollowShooterComponentPb");
+    assert!(has_summoner, "spawned entity missing SummonerComponent");
+
+    let pf = add_follower_notify.expect("PlayerFollowerNotify");
+    assert_eq!(pf.PlayerId, 1);
+    assert_eq!(pf.ListPlayerFollowerPb.len(), 1);
+    assert_eq!(
+        pf.ListPlayerFollowerPb[0].Type,
+        Some(EPlayerFollower::Auxiliary)
+    );
+    assert_eq!(pf.ListPlayerFollowerPb[0].EntityId, spawned_net_id);
+
+    let aux_entry = h
+        .state
+        .scene
+        .as_ref()
+        .expect("scene")
+        .entity(player_entity.net_id)
+        .and_then(|e| e.follower.as_ref())
+        .and_then(|f| {
+            f.list
+                .iter()
+                .find(|entry| entry.kind == FollowerType::EPlayerFollowerAuxiliary.to_i32())
+        })
+        .expect("Auxiliary follower entry on PlayerEntity");
+    assert_eq!(aux_entry.entity_id, spawned_net_id);
+
+    // 2. RemoveTrialFollowShooter pushes PlayerFollowerNotify(0) BEFORE EntityRemoveNotify
+    //    and despawns the follow shooter entity.
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        let mut cbs = ActionCallbacks::default();
+        let act = serde_json::json!({
+            "Name": "RemoveTrialFollowShooter",
+            "Params": { "Id": SUMMON_CFG_ID }
+        });
+        execute_action(&mut qctx, &mut cbs, 151_000_000, 1, &act)
+            .expect("RemoveTrialFollowShooter");
+    }
+
+    assert_eq!(
+        h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .trial_follow_shooter_net_id,
+        None
+    );
+    assert!(
+        h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .entity(spawned_net_id)
+            .is_none()
+    );
+    assert_eq!(
+        h.state
+            .player_components
+            .progress
+            .info
+            .get_key_int("trial:follow_shooter"),
+        0
+    );
+
+    let mut rem_seq = Vec::new();
+    let mut rem_follower_notify = None;
+    let mut rem_entity_notify = None;
+    while let Ok(frame) = h.rx.try_recv() {
+        if frame.len() < 3 {
+            continue;
+        }
+        let Ok(msg) = Message::decode(&frame[3..]) else {
+            continue;
+        };
+        let msg_id = msg.header.message_id();
+        if msg_id == PlayerFollowerNotify::MSG_ID {
+            rem_seq.push(msg_id);
+            rem_follower_notify = Some(
+                PlayerFollowerNotify::decode(&msg.payload).expect("decode PlayerFollowerNotify"),
+            );
+        } else if msg_id == EntityRemoveNotify::MSG_ID {
+            rem_seq.push(msg_id);
+            rem_entity_notify =
+                Some(EntityRemoveNotify::decode(&msg.payload).expect("decode EntityRemoveNotify"));
+        }
+    }
+    assert_eq!(
+        rem_seq,
+        vec![PlayerFollowerNotify::MSG_ID, EntityRemoveNotify::MSG_ID],
+        "PlayerFollowerNotify(0) must precede EntityRemoveNotify"
+    );
+    let rpf = rem_follower_notify.expect("remove PlayerFollowerNotify");
+    assert_eq!(
+        rpf.ListPlayerFollowerPb[0].Type,
+        Some(EPlayerFollower::Auxiliary)
+    );
+    assert_eq!(rpf.ListPlayerFollowerPb[0].EntityId, 0);
+    let ren = rem_entity_notify.expect("EntityRemoveNotify");
+    assert_eq!(ren.RemoveInfos.len(), 1);
+    assert_eq!(ren.RemoveInfos[0].EntityId, spawned_net_id);
+}
