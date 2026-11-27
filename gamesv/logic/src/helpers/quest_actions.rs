@@ -5309,6 +5309,9 @@ fn apply_guide_trigger<S: PushSink + ?Sized>(
     callbacks: &ActionCallbacks<'_, S>,
     params: &Map<String, Value>,
 ) -> io::Result<()> {
+    if !sonoro_gamesv_data::zon_config::GameConfig::embedded().autocomplete_guides {
+        return Ok(());
+    }
     let Some(gid) = json_int(params.get("GuideId")) else {
         return Ok(());
     };

@@ -63,7 +63,7 @@ pub fn handle_guide_trigger_request(
     events: &mut EventQueue,
     req: GuideTriggerRequest,
 ) -> Result<GuideTriggerResponse, String> {
-    if req.GroupId > 0 {
+    if req.GroupId > 0 && GameConfig::embedded().autocomplete_guides {
         let mut qctx = state.quest_context(events);
         quest_engine::triggers::on_guide_finish(&mut qctx, req.GroupId)
             .map_err(|e| e.to_string())?;

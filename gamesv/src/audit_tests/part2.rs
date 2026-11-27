@@ -8136,3 +8136,104 @@ fn audit_145_trial_follow_shooter_spawns_entity_and_pushes_player_follower_notif
     assert_eq!(ren.RemoveInfos.len(), 1);
     assert_eq!(ren.RemoveInfos[0].EntityId, spawned_net_id);
 }
+
+#[test]
+fn audit_146_guide_trigger_waits_for_guide_finish_request() {
+    use sonoro_proto::pb::{GuideFinishRequest, GuideTriggerRequest};
+
+    let mut h = TestHarness::new("audit146", Some(8));
+    let _ = h.drain_count();
+
+    const QUEST_ID: i32 = 139_000_025;
+    // Inside ParallelSelect 114: node 146 waits for Guide 10018, node 153 waits for Guide 10053.
+    h.state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: QUEST_ID,
+            active_nodes: vec![6, 146, 116, 153],
+            finished_nodes: Vec::new(),
+            killed_entities: Vec::new(),
+        });
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(0, "0");
+    let _ = h.drain_count();
+
+    // 1. Server action GuideTrigger(10053) and client GuideTriggerRequest(10053)
+    //    must NOT mark Guide 10053 finished or complete ChildQuest 153/146 prematurely.
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        let mut cbs = ActionCallbacks::default();
+        let act = serde_json::json!({
+            "Name": "GuideTrigger",
+            "Params": { "GuideId": 10053, "Type": "BeginnerGuide" }
+        });
+        execute_action(&mut qctx, &mut cbs, QUEST_ID, 116, &act).expect("GuideTrigger");
+    }
+    let mut events = EventQueue::new();
+    let trig_resp = crate::network::handlers::guide::handle_guide_trigger_request(
+        &mut h.state,
+        &mut events,
+        GuideTriggerRequest { GroupId: 10053 },
+    )
+    .expect("GuideTriggerRequest");
+    assert_eq!(trig_resp.ErrorCode, Some(ErrorCode::Success));
+    assert!(!h.state.player_components.guide.info.has_finished(10053));
+    let aq = h
+        .state
+        .player_components
+        .quest
+        .info
+        .find_active_quest(QUEST_ID)
+        .expect("prologue active");
+    assert!(aq.is_node_active(153), "Node 153 must wait for GuideFinishRequest");
+    assert!(aq.is_node_active(146), "Node 146 must stay active");
+
+    // 2. GuideFinishRequest(10053) completes Node 153 (and its GuideTrigger(10018) FinishAction
+    //    must still leave Guide 10018 / Node 146 waiting for GuideFinishRequest(10018)).
+    let fin1 = crate::network::handlers::guide::handle_guide_finish_request(
+        &mut h.state,
+        &mut events,
+        GuideFinishRequest { GroupId: 10053 },
+    )
+    .expect("GuideFinishRequest 10053");
+    assert_eq!(fin1.ErrorCode, Some(ErrorCode::Success));
+    assert!(h.state.player_components.guide.info.has_finished(10053));
+    assert!(!h.state.player_components.guide.info.has_finished(10018));
+    let aq = h
+        .state
+        .player_components
+        .quest
+        .info
+        .find_active_quest(QUEST_ID)
+        .expect("prologue active");
+    assert!(aq.is_node_finished(153), "Node 153 should complete after GuideFinishRequest 10053");
+    assert!(
+        aq.is_node_active(146),
+        "Node 146 must not auto-complete from Node 153's GuideTrigger(10018) FinishAction"
+    );
+
+    // 3. GuideFinishRequest(10018) completes Node 146.
+    let fin2 = crate::network::handlers::guide::handle_guide_finish_request(
+        &mut h.state,
+        &mut events,
+        GuideFinishRequest { GroupId: 10018 },
+    )
+    .expect("GuideFinishRequest 10018");
+    assert_eq!(fin2.ErrorCode, Some(ErrorCode::Success));
+    assert!(h.state.player_components.guide.info.has_finished(10018));
+    let aq = h
+        .state
+        .player_components
+        .quest
+        .info
+        .find_active_quest(QUEST_ID)
+        .expect("prologue active");
+    assert!(aq.is_node_finished(146), "Node 146 should complete after GuideFinishRequest 10018");
+}
