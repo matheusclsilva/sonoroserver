@@ -9501,4 +9501,23 @@ fn audit_156_world_animal_entity_pb_carries_the_local_player_id() {
             .is_none(),
         "the animal stays an evictable world entity"
     );
+
+    // An animal from SummonEntity / CreatePrefab (spawn_synthetic_template_entity) too.
+    let summoned = entity_cmd::spawn_synthetic_template_entity(
+        h.state.scene.as_mut().unwrap(),
+        &h.state.fs,
+        &h.state.assets,
+        &mut h.state.conn,
+        &h.state.player_components.basic,
+        "Animal021",
+        0,
+        [0.0; 3],
+        [0.0; 3],
+    )
+    .expect("summon Animal021");
+    let sc = h.state.scene.as_ref().unwrap();
+    assert_eq!(
+        sc.entity(summoned).unwrap().to_proto(&h.state.assets, 0).PlayerId,
+        sc.player_id
+    );
 }

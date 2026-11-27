@@ -776,6 +776,9 @@ pub fn spawn_synthetic_template_entity<S: PushSink + ?Sized>(
     );
     storage.position = Some(PositionComponent { location, rotation });
     storage.buffs = Some(FightBuffComponent::default());
+    if spawn_base.entity_type == EntityType::Animal {
+        storage.world_item.controller_player_id = scene.player_id;
+    }
     if ai_runtime {
         let ai_id = components_data.AiComponent.as_ref().and_then(|c| c.AiId);
         storage.fsm =
