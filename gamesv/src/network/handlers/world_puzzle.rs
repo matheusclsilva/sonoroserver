@@ -102,7 +102,8 @@ use sonoro_proto::pb::{
     ResonantChainOptionalLimitResponse, ReviveRequest, ReviveResponse,
     RoadNetworkEntityUpdateCurRoadPush, RoleGood, RoleProperSettle, Rotator,
     SceneGroupDataAndCurFormationEntityRequest, SceneGroupDataAndCurFormationEntityResponse,
-    SceneItemBlackboardParamValueOneof, SceneItemMoveSplineRequest, SceneItemMoveSplineResponse,
+    SceneItemBlackboardParamValueOneof, SceneItemLifeCycleComponentCreateCtxPb,
+    SceneItemMoveSplineRequest, SceneItemMoveSplineResponse,
     SceneItemMoveTargetRequest, SceneItemMoveTargetResponse, SceneItemSequenceFrameEndRequest,
     SceneItemSequenceFrameEndResponse, SceneItemSequenceFrameStartRequest,
     SceneItemSequenceFrameStartResponse, SceneItemSetPosSenderRequest,
@@ -1049,12 +1050,11 @@ pub fn handle_set_init_tag_request(
     state: &mut State,
     req: SetInitTagRequest,
 ) -> Result<SetInitTagResponse, String> {
-    pb_kv::persist_claim(
-        &state.fs,
-        &mut state.player_components.progress,
-        &format!("init_tag:{}", req.EntityId),
-    )
-    .map_err(|e| e.to_string())?;
+    let claim_key = format!("init_tag:{}", req.EntityId);
+    let already_init = state.player_components.progress.info.has_claim(&claim_key);
+    pb_kv::persist_claim(&state.fs, &mut state.player_components.progress, &claim_key)
+        .map_err(|e| e.to_string())?;
+    let mut resolved: Option<(i64, i32, i32)> = None;
     if let Some(scene) = state.scene.as_mut() {
         let nid_opt = if scene.net_id_map.contains_key(&req.EntityId) {
             Some(req.EntityId)
@@ -1063,20 +1063,87 @@ pub fn handle_set_init_tag_request(
                 .ok()
                 .and_then(|cid| scene.find_entity_net_id_by_config_id(cid))
         };
-        if let Some(nid) = nid_opt
-            && let Some(upd) = scene.update_entity_state_tag(
+        if let Some(nid) = nid_opt {
+            let cfg_id = scene.find_config_id_by_net_id(nid).unwrap_or(0);
+            let map_id = state.assets.resolve_map_config_id(scene.instance_id);
+            resolved = Some((nid, cfg_id, map_id));
+            if let Some(upd) = scene.update_entity_state_tag(
                 &state.assets.tables.gameplay_tag_remap,
                 nid,
                 "关卡.Common.状态.常态",
-            )
-        {
-            quest_actions::emit_entity_state_tag_update_checked(
-                scene,
-                Some(&state.assets),
-                &mut state.conn,
-                nid,
-                upd,
-            );
+            ) {
+                quest_actions::emit_entity_state_tag_update_checked(
+                    scene,
+                    Some(&state.assets),
+                    &mut state.conn,
+                    nid,
+                    upd,
+                );
+            }
+        }
+    }
+    if !already_init
+        && let Some((nid, cfg_id, map_id)) = resolved
+        && cfg_id > 0
+        && let Some(lcfg) = state.assets.find_level_entity(map_id, i64::from(cfg_id))
+    {
+        let tpl = state.assets.find_template_config(&lcfg.BlueprintType);
+        let entity_lc = lcfg.ComponentsData.SceneItemLifeCycleComponent.as_ref();
+        let tpl_lc = tpl
+            .as_ref()
+            .and_then(|t| t.ComponentsData.SceneItemLifeCycleComponent.as_ref());
+        let disabled = entity_lc
+            .and_then(|lc| lc.Disabled)
+            .or_else(|| tpl_lc.and_then(|lc| lc.Disabled))
+            .unwrap_or(false);
+        let acts_opt = if !disabled {
+            entity_lc
+                .and_then(|lc| lc.CreateStageConfig.get("Actions"))
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .or_else(|| {
+                    tpl_lc
+                        .and_then(|lc| lc.CreateStageConfig.get("Actions"))
+                        .and_then(Value::as_array)
+                        .filter(|a| !a.is_empty())
+                })
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(acts) = acts_opt {
+            let mut events = EventQueue::new();
+            {
+                let mut qctx = state.quest_context(&mut events);
+                quest_engine::triggers::push_entity_level_events(
+                    &mut qctx,
+                    GameCtxType::SceneItemLifeCycleComponentCreate,
+                    GameCtxPbCtxInfoOneof::LifeCycleCreateAction(
+                        SceneItemLifeCycleComponentCreateCtxPb {
+                            EntityCtx: Some(EntityCtxPb {
+                                ConfigId: cfg_id,
+                                IncId: nid,
+                            }),
+                        },
+                    ),
+                    &acts,
+                );
+                let prev_owner = if let Some(sc) = qctx.scene.as_deref_mut() {
+                    let prev = sc.active_flow_owner_entity_id;
+                    sc.active_flow_owner_entity_id = nid;
+                    prev
+                } else {
+                    0
+                };
+                let mut cbs = quest_engine::action_callbacks();
+                let res =
+                    quest_actions::execute_action_list(&mut qctx, &mut cbs, cfg_id, 0, &acts);
+                if let Some(sc) = qctx.scene.as_deref_mut() {
+                    sc.active_flow_owner_entity_id = prev_owner;
+                }
+                res.map_err(|e| e.to_string())?;
+            }
+            drain_event_queue_best_effort(&mut events, state);
         }
     }
     Ok(SetInitTagResponse {

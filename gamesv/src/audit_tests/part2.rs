@@ -7659,3 +7659,114 @@ fn audit_142_entity_group_fail_actions_run_once_and_push_entity_group_action_not
         "FailActions must not re-run when trigger was already unmatched"
     );
 }
+
+#[test]
+fn audit_143_set_init_tag_runs_lifecycle_create_stage_actions_once() {
+    use sonoro_gamesv_logic::helpers::quest_engine;
+    use sonoro_proto::enums::GameCtxType;
+    use sonoro_proto::pb::{
+        ActionNotify, EntityCtxPb, GameCtxPbCtxInfoOneof,
+        SceneItemLifeCycleComponentCreateCtxPb, SetInitTagRequest,
+    };
+
+    // Map 8 entity 109800365 has SceneItemLifeCycleComponent.CreateStageConfig.Actions:
+    // [{"Name":"ChangeEntityState","Params":{"EntityId":109800368,"State":"关卡.Common.状态.常态"}}].
+    const SOURCE_CFG: i32 = 109_800_365;
+    const TARGET_CFG: i32 = 109_800_368;
+
+    let mut h = TestHarness::new("audit143", Some(8));
+    let source_nid = {
+        let mut st = EntityComponentStorage::new(
+            0,
+            ConfigComponent {
+                camp: 0,
+                config_id: SOURCE_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::SceneItem,
+                state: EntityState::Default,
+            },
+        );
+        st.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        h.state.scene.as_mut().unwrap().spawn(st).net_id
+    };
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(i64::from(TARGET_CFG), "关卡.Common.状态.激活");
+    let _ = h.drain_count();
+
+    // 1. First SetInitTagRequest runs CreateStageConfig.Actions -> target becomes 常态.
+    let resp = world_puzzle::handle_set_init_tag_request(
+        &mut h.state,
+        SetInitTagRequest {
+            EntityId: source_nid,
+        },
+    )
+    .expect("first SetInitTagRequest");
+    assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(TARGET_CFG)),
+        Some("关卡.Common.状态.常态")
+    );
+
+    // 2. Second SetInitTagRequest must be idempotent and not re-run CreateStageConfig.
+    h.state
+        .player_components
+        .quest
+        .info
+        .set_entity_state(i64::from(TARGET_CFG), "关卡.Common.状态.激活");
+    world_puzzle::handle_set_init_tag_request(
+        &mut h.state,
+        SetInitTagRequest {
+            EntityId: source_nid,
+        },
+    )
+    .expect("second SetInitTagRequest");
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(TARGET_CFG)),
+        Some("关卡.Common.状态.激活"),
+        "CreateStageConfig must run only on initial SetInitTagRequest"
+    );
+
+    // 3. Verify SceneItemLifeCycleComponentCreate ActionNotify builds cleanly for client actions.
+    let _ = h.drain_count();
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        let client_acts = vec![serde_json::json!({
+            "Name": "PostAkEvent",
+            "Params": { "AkEvent": "test" }
+        })];
+        quest_engine::triggers::push_entity_level_events(
+            &mut qctx,
+            GameCtxType::SceneItemLifeCycleComponentCreate,
+            GameCtxPbCtxInfoOneof::LifeCycleCreateAction(
+                SceneItemLifeCycleComponentCreateCtxPb {
+                    EntityCtx: Some(EntityCtxPb {
+                        ConfigId: SOURCE_CFG,
+                        IncId: source_nid,
+                    }),
+                },
+            ),
+            &client_acts,
+        );
+    }
+    let notifies: Vec<ActionNotify> = h.drain_decoded(ActionNotify::MSG_ID);
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(
+        notifies[0].GameCtx.as_ref().and_then(|g| g.CtxType),
+        Some(GameCtxType::SceneItemLifeCycleComponentCreate)
+    );
+}
