@@ -1333,6 +1333,47 @@ pub fn resume_child_quest_finish_actions<S: PushSink + ?Sized>(
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     let akey = action_node_progress_key(quest_id, node.id);
+    // Mark the node as finishing before its actions run: an action (SetVar, ChangeEntityState)
+    // can re-evaluate conditions and reach complete_child_quest_without_advance for this node
+    // again, which returns early while this key is present.
+    if let Some(scene) = ctx.scene.as_deref_mut() {
+        scene.child_finish_action_next_idx.insert(akey, start_idx);
+    }
+    match run_child_quest_finish_segments(ctx, quest_id, node, acts, start_idx, push_updates, akey) {
+        Ok(true) => return Ok(false),
+        Ok(false) => {}
+        Err(err) => {
+            if let Some(scene) = ctx.scene.as_deref_mut() {
+                scene.child_finish_action_next_idx.remove(&akey);
+            }
+            return Err(err);
+        }
+    }
+
+    if let Some(scene) = ctx.scene.as_deref_mut() {
+        scene.child_finish_action_next_idx.remove(&akey);
+    }
+    if node.reward_id > 0 {
+        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), node.reward_id, 6003)?;
+    }
+    ctx.quest_comp.info.mark_node_finished(quest_id, node.id);
+    if push_updates {
+        push_child_quest_finished_status(ctx, quest_id, node.id);
+    }
+    Ok(true)
+}
+
+/// Runs FinishActions from `start_idx`; returns true when it stopped on a sync PlayFlow
+/// (the resume index is then stored under `akey`).
+fn run_child_quest_finish_segments<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    quest_id: i32,
+    node: &NodeEntry,
+    acts: &[Value],
+    start_idx: usize,
+    push_updates: bool,
+    akey: u64,
+) -> io::Result<bool> {
     let mut seg_start = start_idx;
     while seg_start < acts.len() {
         let sync_opt = if push_updates && ctx.scene.is_some() {
@@ -1364,7 +1405,7 @@ pub fn resume_child_quest_finish_actions<S: PushSink + ?Sized>(
             });
             if waiting_flow && let Some(scene) = ctx.scene.as_deref_mut() {
                 scene.child_finish_action_next_idx.insert(akey, sync_idx + 1);
-                return Ok(false);
+                return Ok(true);
             }
             seg_start = sync_idx + 1;
         } else {
@@ -1384,17 +1425,7 @@ pub fn resume_child_quest_finish_actions<S: PushSink + ?Sized>(
         }
     }
 
-    if let Some(scene) = ctx.scene.as_deref_mut() {
-        scene.child_finish_action_next_idx.remove(&akey);
-    }
-    if node.reward_id > 0 {
-        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), node.reward_id, 6003)?;
-    }
-    ctx.quest_comp.info.mark_node_finished(quest_id, node.id);
-    if push_updates {
-        push_child_quest_finished_status(ctx, quest_id, node.id);
-    }
-    Ok(true)
+    Ok(false)
 }
 
 pub fn finish_non_child_node<S: PushSink + ?Sized>(
