@@ -39,6 +39,7 @@ pub use tag::TagComponent;
 pub struct WorldItemState {
     pub gravity: Option<GravityComponent>,
     pub lift: Option<LiftComponent>,
+    pub lift_init_pos: Option<[f32; 3]>,
     pub move_spline: Option<MoveSplineComponent>,
     pub move_to_point: Option<MoveToPointComponent>,
     pub scene_item: Option<SceneItemComponent>,
@@ -89,6 +90,7 @@ impl Default for WorldItemState {
         Self {
             gravity: None,
             lift: None,
+            lift_init_pos: None,
             move_spline: None,
             move_to_point: None,
             scene_item: None,
@@ -292,7 +294,10 @@ impl EntityComponentStorage {
             let t = pos_comp.to_proto();
             entity.Pos = t.Pos.clone();
             entity.Rot = t.Rot;
-            entity.InitPos = t.Pos;
+            entity.InitPos = match self.world_item.lift_init_pos {
+                Some([x, y, z]) => Some(Vector { X: x, Y: y, Z: z }),
+                None => t.Pos,
+            };
         }
 
         let wi = &self.world_item;

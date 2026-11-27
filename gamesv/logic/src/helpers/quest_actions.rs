@@ -2261,19 +2261,12 @@ pub fn sync_world_state_on_join<S: PushSink + ?Sized>(
                         && config_id > 0
                         && let Some(net_id) = scene.find_entity_net_id_by_config_id(config_id)
                         && let Ok(location) = i32::try_from(entry.val)
+                        && location > 0
                         && let Some(storage) = scene.entity_mut(net_id)
                     {
                         storage.world_item.lift = Some(LiftComponent {
                             location,
                         });
-                        ctx.sink.push(
-                            ElevatorMoveNotify::MSG_ID,
-                            &ElevatorMoveNotify {
-                                EntityId: net_id,
-                                Location: location,
-                                MoveType: None,
-                            },
-                        );
                     }
                 }
             }

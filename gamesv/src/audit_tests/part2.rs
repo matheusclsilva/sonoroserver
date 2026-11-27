@@ -3477,7 +3477,7 @@ fn audit_114_cross_instance_skip_clears_black_screen_on_scene_loading_finish() {
 
 #[test]
 fn audit_115_lift_initial_pos_dungeon_level_play_npc_priority_and_batch_spawn() {
-    use sonoro_proto::enums::{ElevatorState, LiftMoveType};
+    use sonoro_proto::enums::ElevatorState;
     use sonoro_proto::pb::{
         ChangeDataLayerFinishRequest, ElevatorMoveNotify, ElevatorStateChangeRequest,
         EntityAddNotify, EnterLevelPlayNotify, JSPatchNotify, MapMarkInfoNotify,
@@ -3557,8 +3557,9 @@ fn audit_115_lift_initial_pos_dungeon_level_play_npc_priority_and_batch_spawn() 
     assert!(!qinfo.progress.entered_level_plays.contains(&241750000));
     assert!(qinfo.world.loaded_datalayers.contains(&850039));
 
-    // 2. Elevator 880850006 MUST spawn at base Transform (-335.0) so client HoverPoints stay
-    // [-335.0, +4365.0], with Floor 2 stored server-side and snapped via CustomSpeed notify.
+    // 2. Elevator 880850006 MUST spawn with InitPos at base Transform (-335.0) so client
+    // HoverPoints stay [-335.0, +4365.0], while Pos and LiftComponentPb reflect Floor 2
+    // (+4365.0) directly in EntityAddNotify (no spawn-time ElevatorMoveNotify race).
     let scene_ref = h.state.scene.as_ref().expect("scene 1529");
     let lift_ent = scene_ref
         .find_entity_net_id_by_config_id(880_850_006)
@@ -3566,10 +3567,15 @@ fn audit_115_lift_initial_pos_dungeon_level_play_npc_priority_and_batch_spawn() 
         .expect("elevator 880850006 spawned in 1529");
     let lift_net_id = lift_ent.net_id;
     assert_eq!(lift_ent.world_item.lift.map(|l| l.location), Some(2));
+    let init_z = lift_ent.world_item.lift_init_pos.expect("lift_init_pos")[2];
+    assert!(
+        (init_z - (-335.0)).abs() < 1.0,
+        "expected elevator 880850006 base InitPos Z ~-335.0, got {init_z}"
+    );
     let lift_z = lift_ent.position.expect("lift position").location[2];
     assert!(
-        (lift_z - (-335.0)).abs() < 1.0,
-        "expected elevator 880850006 base pos Z ~-335.0, got {lift_z}"
+        (lift_z - 4365.0).abs() < 1.0,
+        "expected elevator 880850006 floor-2 Pos Z ~4365.0 (-335 + 4700), got {lift_z}"
     );
     assert!(
         scene_ref.find_entity_net_id_by_config_id(880_850_034).is_some(),
@@ -3592,8 +3598,9 @@ fn audit_115_lift_initial_pos_dungeon_level_play_npc_priority_and_batch_spawn() 
         &cond_eq1,
     ));
 
-    // 3. Spatial world spawns must batch EntityAddNotify + JSPatchNotify, spawn lift via
-    // CustomSpeed ElevatorMoveNotify, and SceneLoadingFinishRequest must NOT flood active quest nodes.
+    // 3. Spatial world spawns must batch EntityAddNotify + JSPatchNotify, spawn lift at its
+    // floor via Pos/InitPos/LiftComponentPb without ElevatorMoveNotify, and
+    // SceneLoadingFinishRequest must NOT flood active quest nodes.
     let mut adds: Vec<EntityAddNotify> = Vec::new();
     let mut lift_moves: Vec<ElevatorMoveNotify> = Vec::new();
     let mut node_updates: Vec<UpdateNodeStatusNotify> = Vec::new();
@@ -3628,16 +3635,26 @@ fn audit_115_lift_initial_pos_dungeon_level_play_npc_priority_and_batch_spawn() 
         "expected batched EntityAddNotify with multiple EntityPbs per notify, got {} notifies for {total_added} entities",
         adds.len()
     );
+    let lift_pb = adds
+        .iter()
+        .flat_map(|n| n.EntityPbs.iter())
+        .find(|e| e.Id == lift_net_id)
+        .expect("lift EntityPb in EntityAddNotify");
+    let pb_init_z = lift_pb.InitPos.as_ref().expect("InitPos").Z;
+    let pb_pos_z = lift_pb.Pos.as_ref().expect("Pos").Z;
+    assert!((pb_init_z - (-335.0)).abs() < 1.0, "InitPos.Z = {pb_init_z}");
+    assert!((pb_pos_z - 4365.0).abs() < 1.0, "Pos.Z = {pb_pos_z}");
+    let pb_lift_loc = lift_pb
+        .ComponentPbs
+        .iter()
+        .find_map(|c| match &c.ComponentPb {
+            Some(EntityComponentPbComponentPbOneof::LiftComponentPb(l)) => Some(l.Location),
+            _ => None,
+        });
+    assert_eq!(pb_lift_loc, Some(2));
     assert!(
-        lift_moves.iter().any(|m| {
-            m.EntityId == lift_net_id
-                && m.Location == 2
-                && m.MoveType
-                    .as_ref()
-                    .and_then(|mt| mt.Type)
-                    == Some(LiftMoveType::CustomSpeed)
-        }),
-        "expected CustomSpeed ElevatorMoveNotify to snap lift 880850006 to floor 2"
+        !lift_moves.iter().any(|m| m.EntityId == lift_net_id),
+        "lift spawn must not emit spawn-time ElevatorMoveNotify: {lift_moves:?}"
     );
     assert!(
         !node_updates
@@ -6981,4 +6998,96 @@ fn audit_137_spawn_z_check_uses_client_aoiz_layer_values() {
 
     assert!(spawned_with_player_dz(500.0), "500 units away in Z, inside the 3000 Z radius");
     assert!(!spawned_with_player_dz(3500.0), "outside the 3000 Z radius");
+}
+
+#[test]
+fn audit_138_lift_spawns_at_saved_floor_with_base_init_pos() {
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::pb::{
+        ElevatorMoveNotify, EntityAddNotify, EntityComponentPbComponentPbOneof,
+    };
+
+    // City Hall lift 109002461 (map 8, template Gameplay106) has base Z = 4876.0 and
+    // StayPositions = [{}, {"Z": 6856}]. When an existing save stores floor 2, EntityAddNotify
+    // must carry InitPos.Z = 4876.0 (for client HoverPoints), Pos.Z = 11732.0 (4876 + 6856),
+    // and LiftComponentPb.Location = 2, with zero spawn-time ElevatorMoveNotify.
+    const LIFT_CFG: i32 = 109_002_461;
+    let mut h = TestHarness::new("audit138", Some(8));
+    let mut events = EventQueue::new();
+    h.state
+        .player_components
+        .progress
+        .info
+        .set_key_int(&format!("lift_target:{LIFT_CFG}"), 2);
+    h.state
+        .player_components
+        .progress
+        .info
+        .set_key_int(&format!("elevator:{LIFT_CFG}"), 2);
+    h.state.scene.as_mut().unwrap().instance.players = vec![ScenePlayer {
+        id: h.state.player_id,
+        group_type: 1,
+        location: [-31_895.0, 120_726.0, 4_876.0],
+        rotation: [0.0; 3],
+    }];
+    let _ = h.drain_count();
+
+    events.enqueue(Event::SpatialSpawnsCheck {
+        player_id: h.state.player_id,
+    });
+    while let Some(ev) = events.dequeue() {
+        let mut rt = h.state.as_runtime(&mut events, None);
+        sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+    }
+
+    let lift_nid = h
+        .state
+        .scene
+        .as_ref()
+        .unwrap()
+        .find_entity_net_id_by_config_id(LIFT_CFG)
+        .expect("109002461 spawned");
+
+    let mut lift_pb = None;
+    let mut lift_moves = Vec::new();
+    while let Ok(frame) = h.rx.try_recv() {
+        if frame.len() < 3 {
+            continue;
+        }
+        if let Ok(msg) = super::Message::decode(&frame[3..]) {
+            if msg.header.message_id() == EntityAddNotify::MSG_ID
+                && let Ok(add) = EntityAddNotify::decode(&msg.payload)
+            {
+                if let Some(found) = add.EntityPbs.into_iter().find(|e| e.Id == lift_nid) {
+                    lift_pb = Some(found);
+                }
+            } else if msg.header.message_id() == ElevatorMoveNotify::MSG_ID
+                && let Ok(mv) = ElevatorMoveNotify::decode(&msg.payload)
+                && mv.EntityId == lift_nid
+            {
+                lift_moves.push(mv);
+            }
+        }
+    }
+
+    let lift_pb = lift_pb.expect("EntityPb for 109002461 in EntityAddNotify");
+    let init_z = lift_pb.InitPos.as_ref().expect("InitPos").Z;
+    let pos_z = lift_pb.Pos.as_ref().expect("Pos").Z;
+    assert!(
+        (init_z - 4_876.0).abs() < 1.0,
+        "InitPos.Z must stay at base Transform Z (4876.0), got {init_z}"
+    );
+    assert!(
+        (pos_z - 11_732.0).abs() < 1.0,
+        "Pos.Z must be floor 2 (4876.0 + 6856.0 = 11732.0), got {pos_z}"
+    );
+    let loc = lift_pb.ComponentPbs.iter().find_map(|c| match &c.ComponentPb {
+        Some(EntityComponentPbComponentPbOneof::LiftComponentPb(l)) => Some(l.Location),
+        _ => None,
+    });
+    assert_eq!(loc, Some(2), "LiftComponentPb.Location must be saved floor 2");
+    assert!(
+        lift_moves.is_empty(),
+        "must not emit spawn-time ElevatorMoveNotify: {lift_moves:?}"
+    );
 }

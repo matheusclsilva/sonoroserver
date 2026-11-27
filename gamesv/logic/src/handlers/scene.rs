@@ -258,6 +258,12 @@ fn entity_interact_config(
     components.InteractComponent
 }
 
+fn storage_is_not_lift(scene: &Scene, net_id: i64) -> bool {
+    scene
+        .entity(net_id)
+        .is_none_or(|s| s.world_item.lift.is_none())
+}
+
 fn apply_stored_world_entity_overrides(
     scene: &mut Scene,
     assets: &Assets,
@@ -272,11 +278,13 @@ fn apply_stored_world_entity_overrides(
     let info = &progress_comp.info;
     let mut changed = false;
 
-    if let (Some(x), Some(y), Some(z)) = (
-        stored_world_float(info, config_id, "x"),
-        stored_world_float(info, config_id, "y"),
-        stored_world_float(info, config_id, "z"),
-    ) && let Some(storage) = scene.entity_mut(net_id)
+    if storage_is_not_lift(scene, net_id)
+        && let (Some(x), Some(y), Some(z)) = (
+            stored_world_float(info, config_id, "x"),
+            stored_world_float(info, config_id, "y"),
+            stored_world_float(info, config_id, "z"),
+        )
+        && let Some(storage) = scene.entity_mut(net_id)
     {
         let mut position = storage.position.unwrap_or_default();
         position.location = [x, y, z];
@@ -303,6 +311,29 @@ fn apply_stored_world_entity_overrides(
 
     if let Some(raw_lift) = opt_key_int(info, &format!("lift_target:{config_id}"))
         && let Ok(lift_loc) = i32::try_from(raw_lift)
+        && lift_loc > 0
+        && let Some(init_pos) = scene
+            .entity(net_id)
+            .and_then(|s| s.world_item.lift_init_pos)
+    {
+        let map_id = assets.resolve_map_config_id(scene.instance_id);
+        let floor_pos = entity_cmd::lift_floor_pos_for_entity(
+            assets,
+            map_id,
+            config_id,
+            init_pos,
+            lift_loc,
+        );
+        if let Some(storage) = scene.entity_mut(net_id) {
+            storage.world_item.lift = Some(LiftComponent { location: lift_loc });
+            if let Some(pos) = storage.position.as_mut() {
+                pos.location = floor_pos;
+            }
+            changed = true;
+        }
+    } else if let Some(raw_lift) = opt_key_int(info, &format!("lift_target:{config_id}"))
+        && let Ok(lift_loc) = i32::try_from(raw_lift)
+        && lift_loc > 0
         && let Some(storage) = scene.entity_mut(net_id)
     {
         storage.world_item.lift = Some(LiftComponent { location: lift_loc });
@@ -2257,8 +2288,6 @@ struct PendingWorldSpawn {
     net_id: Option<i64>,
     gravity_type: Option<GravityFlipType>,
     state_tag_upd: Option<crate::scene::StateTagUpdate>,
-    lift_target_floor: Option<i32>,
-    is_lift: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2416,22 +2445,10 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
             if let Some(tpl) = assets.find_template_config(&cfg.BlueprintType) {
                 tpl.ComponentsData.merge_into(&mut merged_comps);
             }
-            let active_lift = merged_comps
+            let is_lift = merged_comps
                 .LiftComponent
                 .as_ref()
-                .filter(|lc| !lc.Disabled.unwrap_or(false));
-            let is_lift = active_lift.is_some();
-            let lift_target_floor = active_lift.and_then(|lc| {
-                let floor = opt_key_int(&progress_comp.info, &format!("lift_target:{}", cfg.EntityId))
-                    .filter(|&v| v > 0)
-                    .or_else(|| {
-                        opt_key_int(&progress_comp.info, &format!("elevator:{}", cfg.EntityId))
-                            .filter(|&v| v > 0)
-                    })
-                    .and_then(|v| i32::try_from(v).ok())
-                    .unwrap_or_else(|| lc.InitialFloor.unwrap_or(1));
-                (floor > 1).then_some(floor)
-            });
+                .is_some_and(|lc| !lc.Disabled.unwrap_or(false));
             let saved_location = if is_lift {
                 None
             } else if cfg_id32_hint > 0 {
@@ -2471,11 +2488,6 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
                     cfg_id,
                     net_id,
                 )?;
-                if lift_target_floor.is_some()
-                    && let Some(storage) = scene.entity_mut(net_id)
-                {
-                    storage.world_item.lift = Some(LiftComponent { location: 1 });
-                }
                 let mut state_tag_upd = None;
                 if let Some(state_name) =
                     saved_spawn_state(assets, quest_comp, map_comp, map_id, cfg.EntityId)
@@ -2503,8 +2515,6 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
                     net_id: Some(net_id),
                     gravity_type,
                     state_tag_upd,
-                    lift_target_floor,
-                    is_lift,
                 });
             } else {
                 pending.push(PendingWorldSpawn {
@@ -2515,8 +2525,6 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
                     net_id: None,
                     gravity_type: None,
                     state_tag_upd: None,
-                    lift_target_floor,
-                    is_lift,
                 });
             }
         }
@@ -2542,42 +2550,12 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
             continue;
         }
         if let (Some(cfg_id), Some(net_id)) = (item.cfg_id, item.net_id) {
-            if !item.is_lift {
+            if scene
+                .entity(net_id)
+                .is_none_or(|s| s.world_item.lift.is_none())
+            {
                 push_stored_world_transform(scene, sink, &progress_comp.info, cfg_id, net_id);
             }
-            if let Some(location) = item.lift_target_floor {
-                if let Some(storage) = scene.entity_mut(net_id) {
-                    storage.world_item.lift = Some(LiftComponent { location });
-                }
-                sink.push(
-                    ElevatorMoveNotify::MSG_ID,
-                    &ElevatorMoveNotify {
-                        EntityId: net_id,
-                        Location: location,
-                        MoveType: Some(sonoro_proto::pb::LiftMoveTypePb {
-                            Type: Some(sonoro_proto::enums::LiftMoveType::CustomSpeed),
-                            CustomSpeed: Some(sonoro_proto::pb::LiftMoveTypeCustomSpeedPb {
-                                TotalTime: 0.01,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }),
-                    },
-                );
-            } else if !item.is_lift
-                && let Some(location) = opt_key_int(&progress_comp.info, &format!("lift_target:{cfg_id}"))
-                    .and_then(|v| i32::try_from(v).ok())
-            {
-                sink.push(
-                    ElevatorMoveNotify::MSG_ID,
-                    &ElevatorMoveNotify {
-                        EntityId: net_id,
-                        Location: location,
-                        MoveType: None,
-                    },
-                );
-            }
-            push_stored_elevator_state(sink, &progress_comp.info, cfg_id, net_id);
             if let Some(flip_type) = item.gravity_type {
                 sink.push(
                     GravityFlipUpdateTypeNotify::MSG_ID,

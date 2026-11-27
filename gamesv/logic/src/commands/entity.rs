@@ -58,6 +58,76 @@ struct EntitySpawnBase {
 
 const FROZEN_BUFFS: &[i64] = &[10010001];
 const TUNE_BROKEN_BUFFS: &[i64] = &[3161, 3162, 3163, 3164, 9000000000];
+
+/// Compute the world position of an elevator cabin on `floor` (1-indexed) from
+/// its base `InitLocation` (`base_pos`) and `LiftComponent.StayPositions`, matching
+/// `ElevatorNormalMoveStrategy.InitFromConfig` (`HoverPoints[i] = init + StayPositions[i]`).
+pub fn resolve_lift_floor_pos(base_pos: [f32; 3], stay_positions: &Value, floor: i32) -> [f32; 3] {
+    if floor < 1 {
+        return base_pos;
+    }
+    let Some(entry) = stay_positions
+        .as_array()
+        .and_then(|arr| arr.get((floor - 1) as usize))
+        .and_then(|v| v.as_object())
+    else {
+        return base_pos;
+    };
+    let dx = entry.get("X").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let dy = entry.get("Y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let dz = entry.get("Z").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    [base_pos[0] + dx, base_pos[1] + dy, base_pos[2] + dz]
+}
+
+/// Resolve `StayPositions` with a template fallback because generated `MergeFields`
+/// for `LiftComponent` omits `StayPositions`.
+pub fn resolve_lift_stay_positions<'a>(
+    assets: &Assets,
+    blueprint_type: &str,
+    lc: &'a sonoro_gamesv_data::tables::entity_components::lift::LiftComponent,
+) -> Cow<'a, Value> {
+    if lc
+        .StayPositions
+        .as_array()
+        .is_some_and(|arr| !arr.is_empty())
+    {
+        return Cow::Borrowed(&lc.StayPositions);
+    }
+    match assets
+        .find_template_config(blueprint_type)
+        .and_then(|tpl| {
+            tpl.ComponentsData
+                .LiftComponent
+                .as_ref()
+                .map(|tlc| tlc.StayPositions.clone())
+        }) {
+        Some(v) => Cow::Owned(v),
+        None => Cow::Borrowed(&lc.StayPositions),
+    }
+}
+
+/// Compute the world position of lift `cfg_id` on `floor` given its base `InitPos`.
+pub fn lift_floor_pos_for_entity(
+    assets: &Assets,
+    map_id: i32,
+    cfg_id: i32,
+    base_pos: [f32; 3],
+    floor: i32,
+) -> [f32; 3] {
+    let Some(lcfg) = assets.find_level_entity(map_id, i64::from(cfg_id)) else {
+        return base_pos;
+    };
+    if let Some(lc) = &lcfg.ComponentsData.LiftComponent {
+        let stay = resolve_lift_stay_positions(assets, &lcfg.BlueprintType, lc);
+        return resolve_lift_floor_pos(base_pos, stay.as_ref(), floor);
+    }
+    if let Some(tpl) = assets.find_template_config(&lcfg.BlueprintType)
+        && let Some(lc) = &tpl.ComponentsData.LiftComponent
+    {
+        return resolve_lift_floor_pos(base_pos, &lc.StayPositions, floor);
+    }
+    base_pos
+}
 const REPEAT_BOSS_TAG_ID: i32 = 1639442014;
 const STORY_BOSS_TAG_ID: i32 = -1276461747;
 
@@ -1221,8 +1291,25 @@ fn spawn_with_location_internal<S: PushSink + ?Sized>(
     if let Some(lc) = &components_data.LiftComponent
         && !lc.Disabled.unwrap_or(false)
     {
-        storage.world_item.lift = Some(LiftComponent {
-            location: lc.InitialFloor.unwrap_or(1),
+        let floor = progress_info
+            .and_then(|info| {
+                let v = info.get_key_int(&format!("lift_target:{entity_id}"));
+                if v > 0 {
+                    i32::try_from(v).ok()
+                } else {
+                    let e = info.get_key_int(&format!("elevator:{entity_id}"));
+                    (e > 0).then(|| i32::try_from(e).ok()).flatten()
+                }
+            })
+            .unwrap_or_else(|| lc.InitialFloor.unwrap_or(1));
+        let stay_positions =
+            resolve_lift_stay_positions(assets, &entity_config.BlueprintType, lc);
+        storage.world_item.lift = Some(LiftComponent { location: floor });
+        storage.world_item.lift_init_pos = Some(location);
+        let floor_pos = resolve_lift_floor_pos(location, stay_positions.as_ref(), floor);
+        storage.position = Some(PositionComponent {
+            location: floor_pos,
+            rotation,
         });
     }
     if let Some(aic) = &components_data.AiComponent {
