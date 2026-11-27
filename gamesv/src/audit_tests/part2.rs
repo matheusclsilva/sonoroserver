@@ -9285,3 +9285,75 @@ fn audit_153_remove_preload_flows_pushes_remove_preload_flows_notify() {
         {"Type":"RemovePreloadPhantomCharacter"}}}"#);
     assert!(h.drain_decoded::<RemovePreloadFlowsNotify>(RemovePreloadFlowsNotify::MSG_ID).is_empty());
 }
+
+#[test]
+fn audit_154_fire_bullet_actions_push_create_bullet_notify() {
+    // Client: no LevelEvent for FireBullet / FireBulletEffect, so a forwarded action is skipped
+    // (LevelGeneralController.cs:563-576). Server-made bullets reach the client only as the combat
+    // CreateBulletNotify (BulletController.CreateBulletNotify: owner = CombatCommon.EntityId, reads
+    // BulletId, TargetId, Location (else the owner's actor transform) and CombatCommon.MessageId).
+    // Data: FireBullet {Type:{TrackTarget, BulletId, Launcher{Self|Player}, Target{Self|Player}}}
+    // in StateChangeBehaviors / interact options / triggers; FireBulletEffect {Id, X, Y, Z} on
+    // trap triggers (Gameplay060 禁锢陷阱).
+    use sonoro_proto::pb::{CombatNotifyDataMessageOneof, CombatReceiveDataMessageOneof, CombatReceivePackNotify};
+    const OWNER_CFG: i32 = 103_000_849;
+    let mut h = TestHarness::new("audit154", Some(8));
+    let mut events = EventQueue::new();
+    entity_cmd::spawn_with_location(
+        &mut events,
+        h.state.scene.as_mut().unwrap(),
+        &h.state.fs,
+        &h.state.assets,
+        &mut h.state.conn,
+        &h.state.player_components.basic,
+        i64::from(OWNER_CFG),
+        Some(false),
+        Some(false),
+        Some(8),
+        Some([100.0, 200.0, 300.0]),
+        true,
+    )
+    .expect("spawn owner");
+    let owner_nid = h.state.scene.as_ref().unwrap().find_entity_net_id_by_config_id(OWNER_CFG).unwrap();
+    let role_nid = h.state.scene.as_ref().unwrap().current_role_entity_id();
+    let run = |h: &mut TestHarness, events: &mut EventQueue, raw: &str| {
+        let act: Value = serde_json::from_str(raw).unwrap();
+        let mut qctx = h.state.quest_context(events);
+        let mut cbs = ActionCallbacks::default();
+        execute_action(&mut qctx, &mut cbs, OWNER_CFG, 0, &act).unwrap();
+    };
+    let bullets = |h: &mut TestHarness| {
+        let mut out = Vec::new();
+        for pack in h.drain_decoded::<CombatReceivePackNotify>(CombatReceivePackNotify::MSG_ID) {
+            for d in pack.Data {
+                if let Some(CombatReceiveDataMessageOneof::CombatNotifyData(n)) = d.Message
+                    && let Some(CombatNotifyDataMessageOneof::CreateBulletNotify(b)) = n.Message
+                {
+                    out.push((n.CombatCommon.map(|c| c.EntityId), b));
+                }
+            }
+        }
+        out
+    };
+    let _ = h.drain_count();
+
+    run(&mut h, &mut events, r#"{"Name":"FireBullet","Params":{"Type":{"Type":"TrackTarget","BulletId":200300007,
+        "Launcher":{"Type":"Self"},"Target":{"Type":"Player"}}}}"#);
+    let got = bullets(&mut h);
+    assert_eq!(got.len(), 1, "one CreateBulletNotify for FireBullet");
+    let (common_owner, b) = &got[0];
+    assert_eq!(*common_owner, Some(owner_nid));
+    let want_target = if role_nid > 0 { role_nid } else { 0 };
+    assert_eq!((b.OwnerEntityId, b.BulletId, b.TargetId), (owner_nid, 200_300_007, want_target));
+    assert!(b.Location.is_none(), "no Location: the client uses the owner's actor transform");
+    assert!(b.CombatCommon.is_some(), "the client reads CreateBulletNotify.CombatCommon.MessageId");
+    assert!(b.Handle.as_ref().is_some_and(|hd| hd.HandleId != 0));
+
+    run(&mut h, &mut events, r#"{"Name":"FireBulletEffect","Params":{"Id":200200001,"X":250,"Y":0,"Z":300,"Launcher":1}}"#);
+    let got = bullets(&mut h);
+    assert_eq!(got.len(), 1, "one CreateBulletNotify for FireBulletEffect");
+    let b = &got[0].1;
+    assert_eq!((b.OwnerEntityId, b.BulletId), (owner_nid, 200_200_001));
+    let loc = b.Location.as_ref().expect("offset location");
+    assert_eq!((loc.X, loc.Y, loc.Z), (350.0, 200.0, 600.0));
+}

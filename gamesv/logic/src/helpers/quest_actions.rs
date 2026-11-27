@@ -18,7 +18,9 @@ use sonoro_proto::enums::{
 use sonoro_proto::pb::{
     ActionOpenSystemBoardNotify, ActionOpenSystemParam, AddGuestNotify, AlertArea, AlertAreaNotify,
     AudioStatePb, AudioStateUpdateNotify, BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify,
-    CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify, RemovePreloadFlowsNotify,
+    CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify, RemovePreloadFlowsNotify, ActiveBulletHandle, CombatCommon, CombatNotifyData,
+    CombatNotifyDataMessageOneof, CombatReceiveData, CombatReceiveDataMessageOneof, CombatReceivePackNotify,
+    CreateBulletNotify,
     EntityAddDynamicInteractNotify, EntityAddNotify, EntityCommonTagNotify, EntityCtxPb,
     EntityPosResetNotify, EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify,
     EntityRemoveInfo, EntityRemoveNotify, EntityStateReadyNotify, FishingHandInData,
@@ -685,6 +687,7 @@ pub fn execute_action<S: PushSink + ?Sized>(
             apply_prefab_action(ctx, name, params)?;
         }
         "RemovePreloadResource" => apply_remove_preload_resource(ctx, params),
+        "FireBullet" | "FireBulletEffect" => apply_fire_bullet(ctx, quest_id, name, params),
         _ if is_tracked_or_client_action(name) => return Ok(()),
         "ClearEntityVisibleTag" => apply_entity_visibility_list(ctx, params.get("EntityIds"), true)?,
         "MoveSceneItem"
@@ -2868,8 +2871,6 @@ fn is_tracked_or_client_action(name: &str) -> bool {
             | "EnterOrbitalCamera"
             | "ExecBpActorFunc"
             | "ExitOrbitalCamera"
-            | "FireBullet"
-            | "FireBulletEffect"
             | "ModifyActorMaterial"
             | "ModifyActorMedia"
             | "MotorSoarInWindField"
@@ -4236,6 +4237,87 @@ fn resolve_action_entity_cfg_id(scene_opt: Option<&Scene>, params: &Map<String, 
 /// SceneItemNearbyTrackingComponent.EnableTracking from EnableNearbyTrackingNotify
 /// (LevelGamePlayController.OnEnableNearbyTrackingNotify). `ControlType` Other lists config ids;
 /// Self (or no ControlType) is the entity that owns the action.
+/// FireBullet / FireBulletEffect. The client has no LevelEvent for either, so the server spawns the
+/// bullet with the combat CreateBulletNotify (BulletController.CreateBulletNotify). The owner is the
+/// CombatCommon entity; without Location the client uses the owner's actor transform.
+/// - FireBullet {Type:{BulletId, Launcher{Self|Player}, Target{Self|Player}}}
+/// - FireBulletEffect {Id, X, Y, Z}: launched by the owner entity at its position + offset.
+///
+/// INFERIDO: the offset is added in world axes (no owner rotation) and the server-made handle uses
+/// PlayerId 0 with a scene-local HandleId.
+fn apply_fire_bullet<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    owner_id: i32,
+    name: &str,
+    params: &Map<String, Value>,
+) {
+    let Some(scene) = ctx.scene.as_deref_mut() else {
+        return;
+    };
+    let self_nid = nearby_tracking_self_net_id(scene, owner_id);
+    let role_nid = Some(scene.current_role_entity_id()).filter(|&n| n > 0);
+    let pick = |who: Option<&Value>| match who.and_then(|w| json_str(w.get("Type"))) {
+        Some("Player") => role_nid,
+        _ => self_nid,
+    };
+    let (owner, bullet_id, target, location) = if name == "FireBulletEffect" {
+        let Some(owner) = self_nid else {
+            return;
+        };
+        let base = scene
+            .entity(owner)
+            .and_then(|e| e.position)
+            .map_or([0.0; 3], |p| p.location);
+        let off = |k: &str| params.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let loc = Vector {
+            X: base[0] + off("X"),
+            Y: base[1] + off("Y"),
+            Z: base[2] + off("Z"),
+        };
+        (owner, params.get("Id").and_then(Value::as_i64).unwrap_or(0), 0, Some(loc))
+    } else {
+        let Some(t) = params.get("Type").and_then(Value::as_object) else {
+            return;
+        };
+        let Some(owner) = pick(t.get("Launcher")) else {
+            return;
+        };
+        let target = pick(t.get("Target")).unwrap_or(0);
+        (owner, t.get("BulletId").and_then(Value::as_i64).unwrap_or(0), target, None)
+    };
+    if bullet_id <= 0 {
+        return;
+    }
+    let handle = scene.alloc_action_inc_id();
+    let common = CombatCommon {
+        EntityId: owner,
+        ..Default::default()
+    };
+    let notify = CreateBulletNotify {
+        CombatCommon: Some(common.clone()),
+        Handle: Some(ActiveBulletHandle {
+            PlayerId: 0,
+            HandleId: handle,
+        }),
+        OwnerEntityId: owner,
+        BulletId: bullet_id,
+        TargetId: target,
+        Location: location,
+        ..Default::default()
+    };
+    ctx.sink.push(
+        CombatReceivePackNotify::MSG_ID,
+        &CombatReceivePackNotify {
+            Data: vec![CombatReceiveData {
+                Message: Some(CombatReceiveDataMessageOneof::CombatNotifyData(CombatNotifyData {
+                    CombatCommon: Some(common),
+                    Message: Some(CombatNotifyDataMessageOneof::CreateBulletNotify(notify)),
+                })),
+            }],
+        },
+    );
+}
+
 /// RemovePreloadResource. The client preloads plots itself (LevelEventPreload, PreloadFlows) and
 /// unloads one only on RemovePreloadFlowsNotify (PlotController.OnServerNotifyRemovePreloadFlows).
 /// The PhantomCharacter / TrialCharacter variants need an EntityPreloadNotify first, which the
