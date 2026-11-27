@@ -9455,3 +9455,50 @@ fn audit_155_killed_level_play_target_does_not_respawn_before_the_group_clears()
     );
 }
 
+#[test]
+fn audit_156_world_animal_entity_pb_carries_the_local_player_id() {
+    use sonoro_gamesv_logic::commands::entity as entity_cmd;
+
+    // WorldController.SetEntityRole: a non-monster, non-vehicle entity is autonomous on the
+    // client (its AI and movement run there) only when EntityPb.PlayerId is the local player,
+    // NPCs excepted. Every animal in the 2026-11-26 run logged 设置逻辑主控 False, so pigeons
+    // never took off. Animal021 136001954 (butterfly) and Monster034 133001903 are map 8 entities.
+    const ANIMAL: i64 = 136_001_954;
+    const MONSTER: i64 = 133_001_903;
+    let mut h = TestHarness::new("audit156", Some(8));
+    let mut events = EventQueue::new();
+    for id in [ANIMAL, MONSTER] {
+        entity_cmd::spawn_with_location(
+            &mut events,
+            h.state.scene.as_mut().unwrap(),
+            &h.state.fs,
+            &h.state.assets,
+            &mut h.state.conn,
+            &h.state.player_components.basic,
+            id,
+            Some(false),
+            Some(false),
+            Some(8),
+            Some([0.0, 0.0, 0.0]),
+            true,
+        )
+        .expect("spawn");
+    }
+    let sc = h.state.scene.as_ref().unwrap();
+    let pb = |cfg: i64| {
+        let nid = sc.find_entity_net_id_by_config_id(i32::try_from(cfg).unwrap()).unwrap();
+        sc.entity(nid).unwrap().to_proto(&h.state.assets, 0)
+    };
+    let animal = pb(ANIMAL);
+    assert_eq!(animal.EntityType, Some(sonoro_proto::enums::EEntityType::Animal));
+    assert_eq!(animal.PlayerId, sc.player_id, "the local player runs the animal");
+    let monster = pb(MONSTER);
+    assert_eq!(monster.PlayerId, 0, "monster control is unchanged");
+    assert!(
+        sc.entity(sc.find_entity_net_id_by_config_id(136_001_954).unwrap())
+            .unwrap()
+            .player_id
+            .is_none(),
+        "the animal stays an evictable world entity"
+    );
+}

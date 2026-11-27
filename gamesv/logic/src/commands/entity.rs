@@ -1259,6 +1259,9 @@ fn spawn_with_location_internal<S: PushSink + ?Sized>(
     ) {
         storage.world_item.drop_present = true;
     }
+    if spawn_base.entity_type == EntityType::Animal {
+        storage.world_item.controller_player_id = scene.player_id;
+    }
     if spawn_base.entity_type == EntityType::Npc {
         if let Some(nt) = base_info.Category.as_ref().and_then(|c| c.NpcType) {
             storage.world_item.sub_entity_type = nt;

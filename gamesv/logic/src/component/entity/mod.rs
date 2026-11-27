@@ -72,6 +72,10 @@ pub struct WorldItemState {
     pub durability: i32,
     pub drop_item_id: i32,
     pub drop_item_count: i32,
+    /// Player whose client runs this world entity (EntityPb.PlayerId). The client's
+    /// `WorldController.SetEntityRole` makes a non-monster, non-vehicle entity autonomous (AI and
+    /// movement run locally) only when its PlayerId is the local player, NPCs excepted.
+    pub controller_player_id: i32,
     /// SceneItemLifeCycleComponent.CreateStageConfig already ran for this spawn.
     pub lifecycle_create_done: bool,
     pub in_range_entity_ids: [i64; 8],
@@ -124,6 +128,7 @@ impl Default for WorldItemState {
             durability: 0,
             drop_item_id: 0,
             drop_item_count: 1,
+            controller_player_id: 0,
             lifecycle_create_done: false,
             in_range_entity_ids: [0; 8],
             in_range_entity_len: 0,
@@ -273,7 +278,7 @@ impl EntityComponentStorage {
             LivingStatus: living_status,
             IsVisible: self.visible,
             IsActorVisible: self.actor_visible,
-            PlayerId: self.player_id.unwrap_or(0),
+            PlayerId: self.player_id.unwrap_or(self.world_item.controller_player_id),
             InitLinearVelocity: Some(Vector::default()),
             Gravity: Some(match self.world_item.gravity {
                 Some(g) => Vector {
