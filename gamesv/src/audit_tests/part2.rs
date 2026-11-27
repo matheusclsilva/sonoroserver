@@ -9434,5 +9434,24 @@ fn audit_155_killed_level_play_target_does_not_respawn_before_the_group_clears()
         h.state.player_components.quest.info.completed_level_plays.contains(&LP),
         "the group clears on its fourth kill"
     );
+
+    // A new attempt counts its kills again: after the level play is disabled (failure or
+    // leaving) and entered again, its lp_kill claims are gone and the group is whole again.
+    {
+        let mut qctx = h.state.quest_context(&mut events);
+        let mut lp = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).expect("lp ctx");
+        level_play::on_level_play_enabled(&mut lp, LP, false).expect("disable");
+    }
+    assert!(
+        !h.state
+            .player_components
+            .progress
+            .info
+            .dynamic
+            .claims
+            .iter()
+            .any(|c| c.starts_with(&format!("lp_kill:{LP}:"))),
+        "disabling the level play forgets its kills"
+    );
 }
 

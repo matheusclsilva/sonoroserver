@@ -4665,6 +4665,11 @@ fn apply_reset_level_play_action<S: PushSink + ?Sized>(
             dirty_q = true;
         }
         record_progress_int(ctx, &format!("lp_state:{lpid}"), 0, false)?;
+        if crate::helpers::level_play::clear_level_play_kills(ctx.progress_comp.as_deref_mut(), lpid)
+            && let Some(pc) = ctx.progress_comp.as_deref_mut()
+        {
+            pc.save(ctx.fs)?;
+        }
     }
     if dirty_q {
         ctx.quest_comp.save(ctx.fs)?;

@@ -284,6 +284,18 @@ fn lp_key(prefix: &str, a: i32, b: i32) -> String {
     format!("{prefix}:{a}:{b}")
 }
 
+/// Forgets the kills counted for a level play (`lp_kill:{lp}:*`), so a restarted, failed or
+/// rolled-back attempt counts its targets again and they are active targets again.
+pub fn clear_level_play_kills(
+    progress_comp: Option<&mut crate::component::player::PlayerProgressComponent>,
+    lp_id: i32,
+) -> bool {
+    progress_comp.is_some_and(|pc| {
+        pc.info
+            .remove_claims_with_prefix(&format!("lp_kill:{lp_id}:"))
+    })
+}
+
 fn is_lp_node_active(
     progress_comp: Option<&PlayerProgressComponent>,
     lp_id: i32,
@@ -3479,7 +3491,7 @@ pub fn on_level_play_enabled<S: PushSink + ?Sized>(
     }
     let lp_state_key = format!("lp_state:{level_play_id}");
     if !enabled {
-        let mut pc_dirty = false;
+        let mut pc_dirty = clear_level_play_kills(ctx.progress_comp.as_deref_mut(), level_play_id);
         if let Some(pc) = ctx.progress_comp.as_deref_mut()
             && pc.info.get_key_int(&lp_state_key) != 0
         {
@@ -3911,6 +3923,11 @@ fn bt_rollback<S: PushSink + ?Sized>(
 ) -> io::Result<()> {
     if lp_id <= 0 || ctx.quest_comp.info.completed_level_plays.contains(&lp_id) {
         return Ok(());
+    }
+    if clear_level_play_kills(ctx.progress_comp.as_deref_mut(), lp_id)
+        && let Some(pc) = ctx.progress_comp.as_deref_mut()
+    {
+        pc.save(ctx.fs)?;
     }
     ctx.scene.lp_timers.cancel_quest(lp_id);
     ctx.scene.lp_fail_timers.cancel_quest(lp_id);

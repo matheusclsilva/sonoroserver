@@ -585,6 +585,12 @@ impl ProgressInfo {
         self.dynamic.claims.len() != before
     }
 
+    pub fn remove_claims_with_prefix(&mut self, prefix: &str) -> bool {
+        let before = self.dynamic.claims.len();
+        self.dynamic.claims.retain(|c| !c.starts_with(prefix));
+        self.dynamic.claims.len() != before
+    }
+
     pub fn count_claims_prefix(&self, prefix: &str) -> i32 {
         self.dynamic
             .claims
