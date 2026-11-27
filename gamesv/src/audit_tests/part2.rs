@@ -9254,3 +9254,34 @@ fn audit_152_flow_end_replay_follows_the_talk_branch_the_player_chose() {
         );
     }
 }
+
+#[test]
+fn audit_153_remove_preload_flows_pushes_remove_preload_flows_notify() {
+    // Client: LevelEventPreload (PreloadFlows) preloads a plot locally and only unloads it on
+    // RemovePreloadFlowsNotify (PlotController.OnServerNotifyRemovePreloadFlows -> RemovePlot).
+    // Data, tree 683000002: RemovePreloadResource {Type: RemovePreloadFlows, FlowId: {FlowListName,
+    // FlowId, StateId, FlowGuid}}. The PhantomCharacter / TrialCharacter variants stay no-ops: the
+    // server never sends EntityPreloadNotify, so there is nothing to remove.
+    use sonoro_proto::pb::RemovePreloadFlowsNotify;
+    let mut h = TestHarness::new("audit153", Some(8));
+    let mut events = EventQueue::new();
+    let run = |h: &mut TestHarness, events: &mut EventQueue, raw: &str| {
+        let act: Value = serde_json::from_str(raw).unwrap();
+        let mut qctx = h.state.quest_context(events);
+        let mut cbs = ActionCallbacks::default();
+        execute_action(&mut qctx, &mut cbs, 683_000_002, 1, &act).unwrap();
+    };
+    let _ = h.drain_count();
+    run(&mut h, &mut events, r#"{"Name":"RemovePreloadResource","Params":{"RemovePreloadResourceObjectType":
+        {"Type":"RemovePreloadFlows","FlowId":{"FlowListName":"剧情_3_7_主线火匣","FlowId":59,"StateId":1,
+        "FlowGuid":"0a1ccc120888413696d1895ed4c3faf9"}}}}"#);
+    let got: Vec<RemovePreloadFlowsNotify> = h.drain_decoded(RemovePreloadFlowsNotify::MSG_ID);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].FlowListName, "剧情_3_7_主线火匣".as_bytes());
+    assert_eq!((got[0].FlowId, got[0].StateId), (59, 1));
+    assert_eq!(got[0].FlowGuid, b"0a1ccc120888413696d1895ed4c3faf9");
+
+    run(&mut h, &mut events, r#"{"Name":"RemovePreloadResource","Params":{"RemovePreloadResourceObjectType":
+        {"Type":"RemovePreloadPhantomCharacter"}}}"#);
+    assert!(h.drain_decoded::<RemovePreloadFlowsNotify>(RemovePreloadFlowsNotify::MSG_ID).is_empty());
+}

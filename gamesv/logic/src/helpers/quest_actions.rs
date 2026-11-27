@@ -18,7 +18,7 @@ use sonoro_proto::enums::{
 use sonoro_proto::pb::{
     ActionOpenSystemBoardNotify, ActionOpenSystemParam, AddGuestNotify, AlertArea, AlertAreaNotify,
     AudioStatePb, AudioStateUpdateNotify, BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify,
-    CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify,
+    CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify, RemovePreloadFlowsNotify,
     EntityAddDynamicInteractNotify, EntityAddNotify, EntityCommonTagNotify, EntityCtxPb,
     EntityPosResetNotify, EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify,
     EntityRemoveInfo, EntityRemoveNotify, EntityStateReadyNotify, FishingHandInData,
@@ -684,6 +684,7 @@ pub fn execute_action<S: PushSink + ?Sized>(
         "CreatePrefab" | "DestroyPrefab" => {
             apply_prefab_action(ctx, name, params)?;
         }
+        "RemovePreloadResource" => apply_remove_preload_resource(ctx, params),
         _ if is_tracked_or_client_action(name) => return Ok(()),
         "ClearEntityVisibleTag" => apply_entity_visibility_list(ctx, params.get("EntityIds"), true)?,
         "MoveSceneItem"
@@ -2878,7 +2879,6 @@ fn is_tracked_or_client_action(name: &str) -> bool {
             | "PlayWalkingOverlayMontage"
             | "PlayerInput"
             | "PlayerLookTowards"
-            | "RemovePreloadResource"
             | "ReportTrackingEvent"
             | "RequestSystemFunction"
             | "ResumeSystemRewardPopup"
@@ -4236,6 +4236,29 @@ fn resolve_action_entity_cfg_id(scene_opt: Option<&Scene>, params: &Map<String, 
 /// SceneItemNearbyTrackingComponent.EnableTracking from EnableNearbyTrackingNotify
 /// (LevelGamePlayController.OnEnableNearbyTrackingNotify). `ControlType` Other lists config ids;
 /// Self (or no ControlType) is the entity that owns the action.
+/// RemovePreloadResource. The client preloads plots itself (LevelEventPreload, PreloadFlows) and
+/// unloads one only on RemovePreloadFlowsNotify (PlotController.OnServerNotifyRemovePreloadFlows).
+/// The PhantomCharacter / TrialCharacter variants need an EntityPreloadNotify first, which the
+/// server never sends, so they stay no-ops.
+fn apply_remove_preload_resource<S: PushSink + ?Sized>(ctx: &mut QuestContext<'_, S>, params: &Map<String, Value>) {
+    let Some(obj) = params.get("RemovePreloadResourceObjectType").and_then(Value::as_object) else {
+        return;
+    };
+    if json_str(obj.get("Type")) != Some("RemovePreloadFlows") {
+        return;
+    }
+    let Some(flow) = obj.get("FlowId").and_then(Value::as_object) else {
+        return;
+    };
+    let notify = RemovePreloadFlowsNotify {
+        FlowListName: json_str(flow.get("FlowListName")).unwrap_or_default().as_bytes().to_vec(),
+        FlowId: json_int(flow.get("FlowId")).unwrap_or(0),
+        StateId: json_int(flow.get("StateId")).unwrap_or(0),
+        FlowGuid: json_str(flow.get("FlowGuid")).unwrap_or_default().as_bytes().to_vec(),
+    };
+    ctx.sink.push(RemovePreloadFlowsNotify::MSG_ID, &notify);
+}
+
 fn apply_enable_nearby_tracking<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     owner_id: i32,
