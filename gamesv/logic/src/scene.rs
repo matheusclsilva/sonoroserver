@@ -280,6 +280,7 @@ pub struct Scene {
     pub bt_timers: Vec<ActiveBtTimer>,
     pub bt_occupations: Vec<BtOccupation>,
     pub save_node_keys: Vec<u64>,
+    pub range_fail_warning_nodes: HashSet<(i32, i32)>,
     pub trial_role_ids: Vec<i32>,
     pub pending_killed_removals: Vec<KilledRemovalEntry>,
     pub dynamic_interact_options: Vec<DynamicInteractOption>,
@@ -374,6 +375,7 @@ impl Scene {
             bt_timers: Vec::new(),
             bt_occupations: Vec::new(),
             save_node_keys: Vec::new(),
+            range_fail_warning_nodes: HashSet::new(),
             trial_role_ids: Vec::new(),
             pending_killed_removals: Vec::new(),
             dynamic_interact_options: Vec::new(),
@@ -1412,6 +1414,20 @@ impl Scene {
         let prefix = ((owner_id as u32) as u64) << 32;
         let mask = 0xFFFF_FFFF_0000_0000u64;
         self.save_node_keys.retain(|&k| (k & mask) != prefix);
+    }
+
+    pub fn mark_range_fail_warning(&mut self, owner_id: i32, node_id: i32) -> bool {
+        self.range_fail_warning_nodes.insert((owner_id, node_id))
+    }
+
+    pub fn clear_range_fail_warning(&mut self, owner_id: i32, node_id: i32) -> bool {
+        self.range_fail_warning_nodes.remove(&(owner_id, node_id))
+    }
+
+    pub fn clear_range_fail_warnings_for_owner(&mut self, owner_id: i32) -> bool {
+        let before = self.range_fail_warning_nodes.len();
+        self.range_fail_warning_nodes.retain(|&(o, _)| o != owner_id);
+        self.range_fail_warning_nodes.len() != before
     }
 
     pub fn set_entity_position(

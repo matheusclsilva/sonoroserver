@@ -13,11 +13,11 @@ use sonoro_gamesv_fs::quest_info::append_unique_int;
 use sonoro_gamesv_fs::quest_info::remove_int_value;
 use sonoro_proto::enums::{BtType, ChildQuestNodeStatus, FailReason, GameCtxType, NodeStatus};
 use sonoro_proto::pb::{
-    BtRollbackNotify, BtRollbackStartNotify, BtVarUpdateNotify, BehaviorTreeInfoNotify,
-    ChildQuestNodeInfo, EnterLevelPlayNotify, EntityAddNotify, EntityRemoveInfo,
-    EntityRemoveNotify, LeaveLevelPlayNotify, LevelPlayFirstNotify, LevelPlayInfo,
-    LevelPlayInfoNotify, LevelPlayStateNotify, NodeInfo, NodeInfoExtraInfoOneof, TimerInfoPb,
-    TreeInfo, UpdateNodeStatusNotify, UpdateTimerInfoNotify,
+    BtCancelRangeFailWarningNotify, BtRollbackNotify, BtRollbackStartNotify, BtVarUpdateNotify,
+    BehaviorTreeInfoNotify, ChildQuestNodeInfo, EnterLevelPlayNotify, EntityAddNotify,
+    EntityRemoveInfo, EntityRemoveNotify, LeaveLevelPlayNotify, LevelPlayFirstNotify,
+    LevelPlayInfo, LevelPlayInfoNotify, LevelPlayStateNotify, NodeInfo, NodeInfoExtraInfoOneof,
+    TimerInfoPb, TreeInfo, UpdateNodeStatusNotify, UpdateTimerInfoNotify,
 };
 
 use crate::component::entity::small::{
@@ -1139,6 +1139,14 @@ fn deactivate_lp_subtree<S: PushSink + ?Sized>(
         }
         ctx.scene.lp_timers.cancel(lp_id, n.id);
         ctx.scene.lp_fail_timers.cancel(lp_id, n.id);
+        if ctx.scene.clear_range_fail_warning(lp_id, n.id) {
+            ctx.sink.push(
+                BtCancelRangeFailWarningNotify::MSG_ID,
+                &BtCancelRangeFailWarningNotify {
+                    TreeIncId: i64::from(lp_id),
+                },
+            );
+        }
         end_lp_node_timer(ctx, lp_id, n, push_updates);
         ctx.scene.release_occupations_for_node(lp_id, n.id);
         let was_active = is_lp_node_active(ctx.progress_comp.as_deref(), lp_id, n.id);
@@ -2133,6 +2141,14 @@ pub fn complete_level_play<S: PushSink + ?Sized>(
     ctx.scene.lp_timers.cancel_quest(level_play_id);
     ctx.scene.fail_timers.cancel_quest(level_play_id);
     ctx.scene.lp_fail_timers.cancel_quest(level_play_id);
+    if ctx.scene.clear_range_fail_warnings_for_owner(level_play_id) {
+        ctx.sink.push(
+            BtCancelRangeFailWarningNotify::MSG_ID,
+            &BtCancelRangeFailWarningNotify {
+                TreeIncId: i64::from(level_play_id),
+            },
+        );
+    }
     end_lp_timers(ctx, level_play_id);
     ctx.scene
         .lp_active_logic_nodes
@@ -3212,6 +3228,14 @@ pub fn on_player_move<S: PushSink + ?Sized>(
                 ctx.scene.sent_lp_bt_trees.remove(&lp_id);
                 ctx.scene.lp_timers.cancel_quest(lp_id);
                 ctx.scene.lp_fail_timers.cancel_quest(lp_id);
+                if ctx.scene.clear_range_fail_warnings_for_owner(lp_id) {
+                    ctx.sink.push(
+                        BtCancelRangeFailWarningNotify::MSG_ID,
+                        &BtCancelRangeFailWarningNotify {
+                            TreeIncId: i64::from(lp_id),
+                        },
+                    );
+                }
                 ctx.scene
                     .release_occupations_for_tree(lp_id, i64::from(lp_id));
                 ctx.scene.remove_bt_timers_for_owner(lp_id);
@@ -3453,6 +3477,14 @@ pub fn on_level_play_enabled<S: PushSink + ?Sized>(
         ctx.scene.lp_timers.cancel_quest(level_play_id);
         ctx.scene.fail_timers.cancel_quest(level_play_id);
         ctx.scene.lp_fail_timers.cancel_quest(level_play_id);
+        if ctx.scene.clear_range_fail_warnings_for_owner(level_play_id) {
+            ctx.sink.push(
+                BtCancelRangeFailWarningNotify::MSG_ID,
+                &BtCancelRangeFailWarningNotify {
+                    TreeIncId: i64::from(level_play_id),
+                },
+            );
+        }
         end_lp_timers(ctx, level_play_id);
         ctx.scene
             .lp_active_logic_nodes
@@ -3870,6 +3902,14 @@ fn bt_rollback<S: PushSink + ?Sized>(
     }
     ctx.scene.lp_timers.cancel_quest(lp_id);
     ctx.scene.lp_fail_timers.cancel_quest(lp_id);
+    if ctx.scene.clear_range_fail_warnings_for_owner(lp_id) {
+        ctx.sink.push(
+            BtCancelRangeFailWarningNotify::MSG_ID,
+            &BtCancelRangeFailWarningNotify {
+                TreeIncId: i64::from(lp_id),
+            },
+        );
+    }
     end_lp_timers(ctx, lp_id);
     ctx.scene
         .release_occupations_for_tree(lp_id, i64::from(lp_id));

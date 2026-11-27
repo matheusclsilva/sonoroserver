@@ -7820,3 +7820,103 @@ fn audit_143_set_init_tag_runs_lifecycle_create_stage_actions_once() {
         Some(GameCtxType::SceneItemLifeCycleComponentCreate)
     );
 }
+
+#[test]
+fn audit_144_range_limiting_pushes_warning_and_cancel_notifies() {
+    let mut h = TestHarness::new("audit144", Some(8));
+    let _ = h.drain_count();
+
+    const QUEST_ID: i32 = 114_000_018;
+    const FAIL_NODE_ID: i32 = 150;
+    const INSIDE_POS: [f32; 3] = [-125_731.55, 246_574.02, 1_646.4];
+    const OUTSIDE_POS: [f32; 3] = [-115_000.0, 246_574.02, 1_646.4];
+
+    h.state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: QUEST_ID,
+            active_nodes: vec![149],
+            finished_nodes: Vec::new(),
+            killed_entities: Vec::new(),
+        });
+
+    let eval_at = |h: &mut TestHarness, pos: [f32; 3]| {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::tree::check_active_quest_failed_monitors(&mut qctx, Some(pos))
+            .expect("check_active_quest_failed_monitors")
+    };
+
+    // 1. Inside range: marks entry without emitting any warning notify.
+    assert!(!eval_at(&mut h, INSIDE_POS));
+    let warns: Vec<sonoro_proto::pb::BtRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtRangeFailWarningNotify::MSG_ID);
+    assert!(warns.is_empty());
+
+    // 2. Move outside range: emits BtRangeFailWarningNotify once and arms fail timer.
+    assert!(!eval_at(&mut h, OUTSIDE_POS));
+    let warns: Vec<sonoro_proto::pb::BtRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtRangeFailWarningNotify::MSG_ID);
+    assert_eq!(warns.len(), 1);
+    assert_eq!(warns[0].TreeIncId, i64::from(QUEST_ID));
+    assert!(
+        h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .fail_timers
+            .contains(QUEST_ID, FAIL_NODE_ID)
+    );
+
+    // Staying outside on a subsequent check must not duplicate BtRangeFailWarningNotify.
+    assert!(!eval_at(&mut h, OUTSIDE_POS));
+    let warns: Vec<sonoro_proto::pb::BtRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtRangeFailWarningNotify::MSG_ID);
+    assert!(warns.is_empty());
+
+    // 3. Return inside range: emits BtCancelRangeFailWarningNotify once and cancels fail timer.
+    assert!(!eval_at(&mut h, INSIDE_POS));
+    let cancels: Vec<sonoro_proto::pb::BtCancelRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtCancelRangeFailWarningNotify::MSG_ID);
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0].TreeIncId, i64::from(QUEST_ID));
+    assert!(
+        !h.state
+            .scene
+            .as_ref()
+            .expect("scene")
+            .fail_timers
+            .contains(QUEST_ID, FAIL_NODE_ID)
+    );
+
+    // Staying inside must not duplicate BtCancelRangeFailWarningNotify.
+    assert!(!eval_at(&mut h, INSIDE_POS));
+    let cancels: Vec<sonoro_proto::pb::BtCancelRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtCancelRangeFailWarningNotify::MSG_ID);
+    assert!(cancels.is_empty());
+
+    // 4. Move outside again, then verify quest rollback clears warning and pushes cancel notify.
+    assert!(!eval_at(&mut h, OUTSIDE_POS));
+    let warns: Vec<sonoro_proto::pb::BtRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtRangeFailWarningNotify::MSG_ID);
+    assert_eq!(warns.len(), 1);
+    {
+        let mut evq = EventQueue::new();
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::tree::rollback_quest_to_node(
+            &mut qctx,
+            QUEST_ID,
+            FAIL_NODE_ID,
+            sonoro_proto::enums::FailReason::TimeoutFail,
+            false,
+        )
+        .expect("rollback_quest_to_node");
+    }
+    let cancels: Vec<sonoro_proto::pb::BtCancelRangeFailWarningNotify> =
+        h.drain_decoded(sonoro_proto::pb::BtCancelRangeFailWarningNotify::MSG_ID);
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0].TreeIncId, i64::from(QUEST_ID));
+}

@@ -11,10 +11,10 @@ use sonoro_gamesv_data::lazy_node_store::NodeEntry;
 use sonoro_gamesv_fs::quest_info::{QuestInfo, append_unique_int, remove_int_value};
 use sonoro_proto::enums::{BtType, ErrorCode, QuestFocusReason, QuestLockType, QuestState};
 use sonoro_proto::pb::{
-    BehaviorTreeCtxPb, ConditionGroupFinishInfo, DailyQuestReward, DestroyQuestsNotify,
-    FlowEndNotify, FlowStartNotify, FocusQuestSetNotify, GameCtxPb, GameCtxPbCtxInfoOneof,
-    OneQuestBranchPageInfo, QuestBranchInfo, QuestBranchUpdateNotify, QuestListNotify,
-    QuestLockInfo, QuestLockInfoNotify, RemoveGuestNotify, TraceQuestNotify,
+    BehaviorTreeCtxPb, BtCancelRangeFailWarningNotify, ConditionGroupFinishInfo, DailyQuestReward,
+    DestroyQuestsNotify, FlowEndNotify, FlowStartNotify, FocusQuestSetNotify, GameCtxPb,
+    GameCtxPbCtxInfoOneof, OneQuestBranchPageInfo, QuestBranchInfo, QuestBranchUpdateNotify,
+    QuestListNotify, QuestLockInfo, QuestLockInfoNotify, RemoveGuestNotify, TraceQuestNotify,
     WaitQuestConfirmResourceNotify,
 };
 
@@ -872,6 +872,14 @@ pub fn destroy_quest<S: PushSink + ?Sized>(
     if let Some(scene) = ctx.scene.as_deref_mut() {
         scene.quest_timers.cancel_quest(quest_id);
         scene.fail_timers.cancel_quest(quest_id);
+        if scene.clear_range_fail_warnings_for_owner(quest_id) {
+            ctx.sink.push(
+                BtCancelRangeFailWarningNotify::MSG_ID,
+                &BtCancelRangeFailWarningNotify {
+                    TreeIncId: i64::from(quest_id),
+                },
+            );
+        }
         scene.release_occupations_for_tree(quest_id, i64::from(quest_id));
         scene.clear_save_nodes_for_owner(quest_id);
         scene.clear_action_node_progress_for_owner(quest_id);

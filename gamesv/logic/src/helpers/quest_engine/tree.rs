@@ -10,11 +10,11 @@ use sonoro_proto::enums::{
     BtType, ChildQuestNodeStatus, FailReason, GameCtxType, NodeStatus, QuestState, SuspendType,
 };
 use sonoro_proto::pb::{
-    BehaviorTreeInfoNotify, BtRollbackInfo, BtRollbackInfoNotify, BtRollbackNotify,
-    BtRollbackStartNotify, BtSuspendNotify, FailRollbackData, LowMemoryChangeSceneStartNotify,
-    OccupationPbInfo, OperationRestrictionNotify, QuestFinishListNotify, QuestListNotify,
-    QuestRollBackEndNotify, QuestShowListNotify, QuestInfo as PbQuestInfo, TraceQuestNotify,
-    UpdateNodeStatusNotify,
+    BehaviorTreeInfoNotify, BtCancelRangeFailWarningNotify, BtRangeFailWarningNotify,
+    BtRollbackInfo, BtRollbackInfoNotify, BtRollbackNotify, BtRollbackStartNotify,
+    BtSuspendNotify, FailRollbackData, LowMemoryChangeSceneStartNotify, OccupationPbInfo,
+    OperationRestrictionNotify, QuestFinishListNotify, QuestListNotify, QuestRollBackEndNotify,
+    QuestShowListNotify, QuestInfo as PbQuestInfo, TraceQuestNotify, UpdateNodeStatusNotify,
 };
 use sonoro_proto::wire::PbEnum;
 
@@ -1475,6 +1475,62 @@ fn check_node_occupation_and_save<S: PushSink + ?Sized>(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_distance_limit_check<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    fail_queue: &mut QuestTimerQueue,
+    quest_id: i32,
+    node_id: i32,
+    entered_marker_id: i32,
+    pos_a: [f32; 3],
+    pos_b: [f32; 3],
+    max_dist: f32,
+    countdown: Option<f32>,
+) -> Option<FailReason> {
+    let scene = ctx.scene.as_deref_mut()?;
+    let dx = pos_a[0] - pos_b[0];
+    let dy = pos_a[1] - pos_b[1];
+    let dz = pos_a[2] - pos_b[2];
+    let inside = (dx * dx + dy * dy + dz * dz) <= (max_dist * max_dist);
+    if inside {
+        scene.mark_save_node_entered(quest_id, entered_marker_id);
+        if countdown.is_some() {
+            fail_queue.cancel(quest_id, node_id);
+            if scene.clear_range_fail_warning(quest_id, node_id) {
+                ctx.sink.push(
+                    BtCancelRangeFailWarningNotify::MSG_ID,
+                    &BtCancelRangeFailWarningNotify {
+                        TreeIncId: i64::from(quest_id),
+                    },
+                );
+            }
+        }
+    } else if scene.has_save_node_entered(quest_id, entered_marker_id) {
+        let secs = countdown.unwrap_or(0.0);
+        if secs > 0.0 {
+            if !fail_queue.contains(quest_id, node_id) {
+                let delay_ms = (f64::from(secs) * 1000.0).round() as i64;
+                fail_queue.upsert(QuestTimerEntry {
+                    quest_id,
+                    node_id,
+                    due_ms: now_millis() + delay_ms,
+                });
+            }
+            if scene.mark_range_fail_warning(quest_id, node_id) {
+                ctx.sink.push(
+                    BtRangeFailWarningNotify::MSG_ID,
+                    &BtRangeFailWarningNotify {
+                        TreeIncId: i64::from(quest_id),
+                    },
+                );
+            }
+        } else {
+            return Some(FailReason::OutRangeFail);
+        }
+    }
+    None
+}
+
 fn eval_quest_failed_condition<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     quest_id: i32,
@@ -1512,33 +1568,19 @@ fn eval_quest_failed_condition<S: PushSink + ?Sized>(
                     condition::current_player_pos_3d(&ctx.make_eval_context_for_quest(quest_id))
                 });
                 if let Some(ppos) = ppos_opt
-                    && let Some(scene) = ctx.scene.as_deref_mut()
+                    && let Some(reason) = apply_distance_limit_check(
+                        ctx,
+                        fail_queue,
+                        quest_id,
+                        node.id,
+                        node.id + 1_000_000_000,
+                        ppos,
+                        [px, py, pz],
+                        range,
+                        json_float(rl_val.get("OverRangeCountdown")),
+                    )
                 {
-                    let dx = ppos[0] - px;
-                    let dy = ppos[1] - py;
-                    let dz = ppos[2] - pz;
-                    let inside = (dx * dx + dy * dy + dz * dz) <= (range * range);
-                    let entered_marker_id = node.id + 1_000_000_000;
-                    if inside {
-                        scene.mark_save_node_entered(quest_id, entered_marker_id);
-                        if rl_val.get("OverRangeCountdown").is_some() {
-                            fail_queue.cancel(quest_id, node.id);
-                        }
-                    } else if scene.has_save_node_entered(quest_id, entered_marker_id) {
-                        let countdown = json_float(rl_val.get("OverRangeCountdown")).unwrap_or(0.0);
-                        if countdown > 0.0 {
-                            if !fail_queue.contains(quest_id, node.id) {
-                                let delay_ms = (f64::from(countdown) * 1000.0).round() as i64;
-                                fail_queue.upsert(QuestTimerEntry {
-                                    quest_id,
-                                    node_id: node.id,
-                                    due_ms: now_millis() + delay_ms,
-                                });
-                            }
-                        } else {
-                            return Ok(Some(FailReason::OutRangeFail));
-                        }
-                    }
+                    return Ok(Some(reason));
                 }
             }
         }
@@ -1559,33 +1601,19 @@ fn eval_quest_failed_condition<S: PushSink + ?Sized>(
             });
             let epos_opt = resolve_scene_or_asset_entity_pos_3d(ctx, target_eid);
             if let (Some(ppos), Some(epos)) = (ppos_opt, epos_opt)
-                && let Some(scene) = ctx.scene.as_deref_mut()
+                && let Some(reason) = apply_distance_limit_check(
+                    ctx,
+                    fail_queue,
+                    quest_id,
+                    node.id,
+                    node.id + 1_500_000_000,
+                    ppos,
+                    epos,
+                    max_dist,
+                    json_float(edl_val.get("OverMaxCountdown")),
+                )
             {
-                let dx = ppos[0] - epos[0];
-                let dy = ppos[1] - epos[1];
-                let dz = ppos[2] - epos[2];
-                let inside = (dx * dx + dy * dy + dz * dz) <= (max_dist * max_dist);
-                let entered_marker_id = node.id + 1_500_000_000;
-                if inside {
-                    scene.mark_save_node_entered(quest_id, entered_marker_id);
-                    if edl_val.get("OverMaxCountdown").is_some() {
-                        fail_queue.cancel(quest_id, node.id);
-                    }
-                } else if scene.has_save_node_entered(quest_id, entered_marker_id) {
-                    let countdown = json_float(edl_val.get("OverMaxCountdown")).unwrap_or(0.0);
-                    if countdown > 0.0 {
-                        if !fail_queue.contains(quest_id, node.id) {
-                            let delay_ms = (f64::from(countdown) * 1000.0).round() as i64;
-                            fail_queue.upsert(QuestTimerEntry {
-                                quest_id,
-                                node_id: node.id,
-                                due_ms: now_millis() + delay_ms,
-                            });
-                        }
-                    } else {
-                        return Ok(Some(FailReason::OutRangeFail));
-                    }
-                }
+                return Ok(Some(reason));
             }
         }
     }
@@ -2043,6 +2071,14 @@ pub fn rollback_quest_to_node<S: PushSink + ?Sized>(
     if let Some(scene) = ctx.scene.as_deref_mut() {
         scene.quest_timers.cancel_quest(quest_id);
         scene.fail_timers.cancel_quest(quest_id);
+        if scene.clear_range_fail_warnings_for_owner(quest_id) {
+            ctx.sink.push(
+                BtCancelRangeFailWarningNotify::MSG_ID,
+                &BtCancelRangeFailWarningNotify {
+                    TreeIncId: i64::from(quest_id),
+                },
+            );
+        }
         scene.release_occupations_for_tree(quest_id, i64::from(quest_id));
         scene.clear_save_nodes_for_owner(quest_id);
         scene.clear_action_node_progress_for_owner(quest_id);
@@ -2176,6 +2212,14 @@ pub fn succeed_quest<S: PushSink + ?Sized>(
     if let Some(scene) = ctx.scene.as_deref_mut() {
         scene.quest_timers.cancel_quest(quest_id);
         scene.fail_timers.cancel_quest(quest_id);
+        if scene.clear_range_fail_warnings_for_owner(quest_id) {
+            ctx.sink.push(
+                BtCancelRangeFailWarningNotify::MSG_ID,
+                &BtCancelRangeFailWarningNotify {
+                    TreeIncId: i64::from(quest_id),
+                },
+            );
+        }
         scene.release_occupations_for_tree(quest_id, i64::from(quest_id));
         scene.clear_save_nodes_for_owner(quest_id);
         scene.clear_action_node_progress_for_owner(quest_id);
@@ -2270,6 +2314,14 @@ pub fn deactivate_subtree<S: PushSink + ?Sized>(
         if let Some(scene) = ctx.scene.as_deref_mut() {
             scene.quest_timers.cancel(quest_id, n.id);
             scene.fail_timers.cancel(quest_id, n.id);
+            if scene.clear_range_fail_warning(quest_id, n.id) {
+                ctx.sink.push(
+                    BtCancelRangeFailWarningNotify::MSG_ID,
+                    &BtCancelRangeFailWarningNotify {
+                        TreeIncId: i64::from(quest_id),
+                    },
+                );
+            }
             scene.release_occupations_for_node(quest_id, n.id);
         }
         remove_do_interact_options_for_node(ctx, quest_id, n.id);
