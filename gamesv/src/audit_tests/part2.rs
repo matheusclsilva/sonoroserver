@@ -9196,3 +9196,61 @@ fn audit_151_full_town_scene_spawns_teleporters_inside_client_aoi() {
         );
     }
 }
+
+#[test]
+fn audit_152_flow_end_replay_follows_the_talk_branch_the_player_chose() {
+    // Client (FlowShowTalk.NextShowTalkItem / SwitchTalkItem): without a jump the next talk item is the
+    // next one in the list; JumpTalk moves to the item with that Id; FinishTalk ends the ShowTalk.
+    // 剧情_1_3_黑海岸主线 flow 11 state 16 (quest 145000004, DoInteract node 72): talk 3 option 0 jumps to
+    // talk 4 (FinishDoInteract + FinishTalk), option 1 jumps to talk 5 (no actions). Declining must
+    // leave the DoInteract node open; accepting must finish it.
+    use sonoro_proto::pb::{FlowOptionInfo, FlowOptionInfoList};
+    const QUEST: i32 = 145_000_004;
+    const NODE: i32 = 72;
+    const SHOW_TALK: i32 = 5_000_318;
+
+    for (option, expect_finished) in [(1, false), (0, true)] {
+        let mut h = TestHarness::new(&format!("audit152_{option}"), Some(8));
+        let mut events = EventQueue::new();
+        quest_engine::tree::activate_quest(&mut h.state.quest_context(&mut events), QUEST, false)
+            .expect("activate 145000004");
+        {
+            let aq = h
+                .state
+                .player_components
+                .quest
+                .info
+                .find_active_quest_mut(QUEST)
+                .expect("quest active");
+            aq.active_nodes = vec![NODE];
+        }
+        h.state
+            .scene
+            .as_mut()
+            .unwrap()
+            .set_active_flow(77, QUEST, NODE, "剧情_1_3_黑海岸主线", 11, 16);
+        let mut opts = BTreeMap::new();
+        opts.insert(
+            SHOW_TALK,
+            FlowOptionInfoList {
+                OptionIndexList: vec![FlowOptionInfo {
+                    TalkId: 3,
+                    OptionIndex: option,
+                }],
+            },
+        );
+        quest_engine::on_flow_end_with_options(&mut h.state.quest_context(&mut events), 77, &opts, false)
+            .expect("flow end");
+        let finished = h
+            .state
+            .player_components
+            .quest
+            .info
+            .find_active_quest(QUEST)
+            .is_none_or(|aq| aq.is_node_finished(NODE));
+        assert_eq!(
+            finished, expect_finished,
+            "option {option}: DoInteract node {NODE} finished={finished}, expected {expect_finished}"
+        );
+    }
+}

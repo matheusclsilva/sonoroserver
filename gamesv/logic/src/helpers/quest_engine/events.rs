@@ -2440,6 +2440,121 @@ fn execute_single_flow_replay_action<S: PushSink + ?Sized>(
     Ok(())
 }
 
+/// Where a talk item's (or chosen option's) actions send the client next.
+enum TalkStep {
+    Next,
+    Jump(i32),
+    Finish,
+}
+
+fn talk_step_of(actions: Option<&Value>) -> TalkStep {
+    let Some(Value::Array(list)) = actions else {
+        return TalkStep::Next;
+    };
+    for act in list {
+        match json_str(act.get("Name")) {
+            // FinishState / ChangeState leave the flow state, so the ShowTalk ends with them.
+            Some("FinishTalk" | "FinishState" | "ChangeState") => return TalkStep::Finish,
+            Some("JumpTalk") => {
+                let to = act
+                    .get("Params")
+                    .and_then(|p| json_int(p.get("TalkId")))
+                    .unwrap_or(-1);
+                return TalkStep::Jump(to);
+            }
+            _ => {}
+        }
+    }
+    TalkStep::Next
+}
+
+/// Replays one ShowTalk along the path the player actually took, the way the client walks it
+/// (FlowShowTalk.NextShowTalkItem: next item in list order; SwitchTalkItem: JumpTalk to the item
+/// with that Id, or end when it does not exist; FinishTalk ends the ShowTalk). Option choices come
+/// from FlowEndRequest.OptionInfos in the order the client recorded them.
+fn replay_show_talk_path<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    qid: i32,
+    nid: i32,
+    st_aid: i32,
+    tis: &[Value],
+    option_infos: &BTreeMap<i32, FlowOptionInfoList>,
+    outcome: &mut FlowEndReplayOutcome,
+) -> io::Result<()> {
+    let mut choices: Vec<(i32, i32)> = Vec::new();
+    for (&entry_key, entry_val) in option_infos {
+        if st_aid > 0 && entry_key != 0 && entry_key != st_aid {
+            continue;
+        }
+        for sel in &entry_val.OptionIndexList {
+            choices.push((sel.TalkId, sel.OptionIndex));
+        }
+    }
+    let mut idx = 0usize;
+    let mut steps = 0usize;
+    let max_steps = tis.len().saturating_mul(4).max(8);
+    while idx < tis.len() && steps < max_steps {
+        steps += 1;
+        let Some(ti_obj) = tis[idx].as_object() else {
+            idx += 1;
+            continue;
+        };
+        let tid = json_int(ti_obj.get("Id")).unwrap_or(0);
+        for key in ["IntroActions", "Actions"] {
+            if let Some(Value::Array(list)) = ti_obj.get(key) {
+                for act in list {
+                    execute_single_flow_replay_action(ctx, qid, nid, act, outcome)?;
+                }
+            }
+        }
+        let mut step = talk_step_of(ti_obj.get("Actions"));
+        let opts = ti_obj.get("Options").and_then(Value::as_array);
+        if matches!(step, TalkStep::Next)
+            && let Some(opts) = opts.filter(|o| !o.is_empty())
+        {
+            let Some(pos) = choices.iter().position(|&(t, _)| t == tid) else {
+                // No recorded answer for this item. With no choices left the player stopped here.
+                // INFERIDO: with choices still pending for other items, treat it as unrecorded and
+                // move on, so a partial OptionInfos list does not drop the later choices.
+                if choices.is_empty() {
+                    return Ok(());
+                }
+                idx += 1;
+                continue;
+            };
+            let (_, chosen) = choices.remove(pos);
+            let opt_obj = usize::try_from(chosen)
+                .ok()
+                .and_then(|i| opts.get(i))
+                .and_then(Value::as_object);
+            if let Some(opt_obj) = opt_obj {
+                let hidden = opt_obj.get("HiddenOption").and_then(Value::as_bool) == Some(true);
+                let allowed = opt_obj.get("PreCondition").is_none_or(|pc| {
+                    let eval_ctx = ctx.make_eval_context_for_quest(qid);
+                    condition::eval_inline_condition_block(&eval_ctx, pc)
+                });
+                if !hidden && allowed {
+                    if let Some(Value::Array(oacts)) = opt_obj.get("Actions") {
+                        for oact in oacts {
+                            execute_single_flow_replay_action(ctx, qid, nid, oact, outcome)?;
+                        }
+                    }
+                    step = talk_step_of(opt_obj.get("Actions"));
+                }
+            }
+        }
+        match step {
+            TalkStep::Next => idx += 1,
+            TalkStep::Finish => return Ok(()),
+            TalkStep::Jump(to) => match tis.iter().position(|t| json_int(t.get("Id")) == Some(to)) {
+                Some(p) => idx = p,
+                None => return Ok(()),
+            },
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_flow_state_on_end<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
@@ -2480,6 +2595,11 @@ fn replay_flow_state_on_end<S: PushSink + ?Sized>(
             let Some(Value::Array(tis)) = params.get("TalkItems") else {
                 continue;
             };
+
+            if !is_skip {
+                replay_show_talk_path(ctx, qid, nid, st_aid, tis, option_infos, &mut outcome)?;
+                continue;
+            }
 
             for ti in tis {
                 let Some(ti_obj) = ti.as_object() else {
