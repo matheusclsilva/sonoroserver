@@ -7462,3 +7462,101 @@ fn audit_140_open_system_board_with_return_notifies_client_and_records_result_on
     assert_eq!(infr.Type, Some(ActionInfrastructureItemDeliveryType::Road));
     assert_eq!(infr.Id, 1);
 }
+
+#[test]
+fn audit_141_dynamic_interact_actions_push_dynamic_interact_action_notify() {
+    use sonoro_gamesv_logic::scene::DynamicInteractKind;
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::enums::{BtType, GameCtxType};
+    use sonoro_proto::pb::{ActionNotify, EntityDynamicInteractRequest, GameCtxPbCtxInfoOneof};
+
+    const QUEST_ID: i32 = 915_000_003;
+    const NODE_ID: i32 = 235;
+    const ENTITY_CFG: i32 = 109_002_500;
+    const GUID: &str = "audit141-dyn-interact-guid";
+
+    let mut h = TestHarness::new("audit141", Some(8));
+    let mut events = EventQueue::new();
+    let nid = {
+        let mut st = EntityComponentStorage::new(
+            0,
+            ConfigComponent {
+                camp: 0,
+                config_id: ENTITY_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::Npc,
+                state: EntityState::Default,
+            },
+        );
+        st.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        let sc = h.state.scene.as_mut().unwrap();
+        let nid = sc.spawn(st).net_id;
+        let actions_json = serde_json::json!([
+            {
+                "Name": "OpenSystemBoard",
+                "Params": { "SystemType": { "Type": "InformationView", "BoardId": 1001 } }
+            }
+        ])
+        .to_string();
+        sc.upsert_dynamic_interact_option_with_bt(
+            GUID,
+            nid,
+            ENTITY_CFG,
+            BtType::BtTypeQuest,
+            QUEST_ID,
+            NODE_ID,
+            DynamicInteractKind::Actions,
+            "",
+            0,
+            1,
+            &actions_json,
+            "Read",
+        );
+        nid
+    };
+    let _ = h.drain_count();
+
+    let resp = scene::handle_entity_dynamic_interact_request(
+        &mut h.state,
+        &mut events,
+        EntityDynamicInteractRequest {
+            EntityId: nid,
+            OptionGuid: GUID.as_bytes().to_vec(),
+        },
+    )
+    .expect("dynamic interact");
+    assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+
+    let mut action_notifies = Vec::new();
+    while let Ok(frame) = h.rx.try_recv() {
+        if frame.len() < 3 {
+            continue;
+        }
+        if let Ok(msg) = super::Message::decode(&frame[3..])
+            && msg.header.message_id() == ActionNotify::MSG_ID
+            && let Ok(n) = ActionNotify::decode(&msg.payload)
+        {
+            action_notifies.push(n);
+        }
+    }
+    assert_eq!(action_notifies.len(), 1);
+    let ctx = action_notifies[0].GameCtx.as_ref().expect("GameCtx");
+    assert_eq!(ctx.CtxType, Some(GameCtxType::DynamicInteract));
+    let Some(GameCtxPbCtxInfoOneof::DynamicInteract(dyn_ctx)) = &ctx.CtxInfo else {
+        panic!("expected DynamicInteract ctx, got {:?}", ctx.CtxInfo);
+    };
+    assert_eq!(dyn_ctx.OptionGuid, GUID.as_bytes());
+    assert_eq!(dyn_ctx.EntityCtx.as_ref().map(|e| e.IncId), Some(nid));
+    assert_eq!(dyn_ctx.EntityCtx.as_ref().map(|e| e.ConfigId), Some(ENTITY_CFG));
+    let final_ctx = dyn_ctx
+        .finalOptionCtx
+        .as_ref()
+        .expect("finalOptionCtx must always be populated");
+    assert_eq!(
+        final_ctx.CtxType,
+        Some(GameCtxType::DoInteractChildQuestNode)
+    );
+}

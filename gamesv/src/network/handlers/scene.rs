@@ -10,27 +10,28 @@ use sonoro_gamesv_logic::helpers::{
     map as map_helper, quest_actions, quest_engine, role as role_helper,
 };
 use sonoro_gamesv_logic::scene::{DynamicInteractKind, now_millis};
-use sonoro_proto::enums::{BtType, ErrorCode, ExitVehicleType, VehicleSource};
+use sonoro_proto::enums::{BtType, ErrorCode, ExitVehicleType, GameCtxType, VehicleSource};
 use sonoro_proto::pb::{
     AnimalDestroyRequest, AnimalDestroyResponse, AnimalDieRequest, AnimalDieResponse,
     AnimalDropRequest, AnimalDropResponse, ApplySceneClientEntityIncIdRequest,
     ApplySceneClientEntityIncIdResponse, AwakeItemVehicleRequest, AwakeItemVehicleResponse,
-    ChangeWeatherRequest, ChangeWeatherResponse, ClientEntityInfoPb,
-    ClientEntityInfoPbDOLLARFyOneof, ClientEntityInfoPbWFyOneof, EntityActiveRequest,
-    EntityActiveResponse, EntityDynamicInteractRequest, EntityDynamicInteractResponse,
+    BehaviorTreeCtxPb, ChangeWeatherRequest, ChangeWeatherResponse, ClientEntityInfoPb,
+    ClientEntityInfoPbDOLLARFyOneof, ClientEntityInfoPbWFyOneof, DoInteractChildQuestNodeCtxPb,
+    DynamicInteractCtxPb, EntityActiveRequest, EntityActiveResponse, EntityCtxPb,
+    EntityDynamicInteractRequest, EntityDynamicInteractResponse,
     EntityEnterVehicleRequest, EntityEnterVehicleRequestExitOneof, EntityEnterVehicleResponse,
     EntityInteractRequest, EntityInteractResponse, EntityPosAbnormalRequest,
     EntityPosAbnormalResponse, EntityPosResetNotify, EntityPositionRequest,
-    EntityPositionResponse, FlowStartNotify, GetRewardTreasureBoxRequest,
-    GetRewardTreasureBoxResponse, JoinSceneNotifyConfirmRequest, JoinSceneNotifyConfirmResponse,
-    MovePackageNotify, MovePackagePush, MoveReplaySample, MovingEntityData, PlayerMotionRequest,
-    PlayerMotionResponse, Rotator, SceneLoadingFinishRequest, SceneLoadingFinishResponse,
-    TeleportUpdateNotify, UpdateSceneDateRequest, UpdateSceneDateResponse, Vector,
-    VehicleChangePassengerRequest, VehicleChangePassengerResponse, VehicleEnterSharingRequest,
-    VehicleEnterSharingResponse, VehicleFinishRequest, VehicleFinishResponse,
-    VehiclePassengerUpdateNotify, VehicleRemovePassengerRequest, VehicleRemovePassengerResponse,
-    VehicleRequest, VehicleResponse, VehicleUpdateEntityNotify,
-    VehicleUpdateNotify,
+    EntityPositionResponse, FlowStartNotify, GameCtxPb, GameCtxPbCtxInfoOneof,
+    GetRewardTreasureBoxRequest, GetRewardTreasureBoxResponse, JoinSceneNotifyConfirmRequest,
+    JoinSceneNotifyConfirmResponse, MovePackageNotify, MovePackagePush, MoveReplaySample,
+    MovingEntityData, PlayerMotionRequest, PlayerMotionResponse, Rotator,
+    SceneLoadingFinishRequest, SceneLoadingFinishResponse, TeleportUpdateNotify,
+    UpdateSceneDateRequest, UpdateSceneDateResponse, Vector, VehicleChangePassengerRequest,
+    VehicleChangePassengerResponse, VehicleEnterSharingRequest, VehicleEnterSharingResponse,
+    VehicleFinishRequest, VehicleFinishResponse, VehiclePassengerUpdateNotify,
+    VehicleRemovePassengerRequest, VehicleRemovePassengerResponse, VehicleRequest, VehicleResponse,
+    VehicleUpdateEntityNotify, VehicleUpdateNotify,
 };
 
 use super::State;
@@ -1112,6 +1113,50 @@ pub fn handle_entity_dynamic_interact_request(
             if let Ok(acts) = serde_json::from_str::<Vec<serde_json::Value>>(&opt.actions_json)
                 && !acts.is_empty()
             {
+                let cfg_id = if opt.entity_config_id > 0 {
+                    opt.entity_config_id
+                } else {
+                    qctx.scene
+                        .as_deref()
+                        .and_then(|s| s.find_config_id_by_net_id(target_entity_id))
+                        .unwrap_or(0)
+                };
+                let entity_ctx = EntityCtxPb {
+                    ConfigId: cfg_id,
+                    IncId: target_entity_id,
+                };
+                // LevelGeneralContextUtil.CreateDynamicInteractContext reads
+                // finalOptionCtx.CtxType unconditionally without a null check.
+                let final_option_ctx = if opt.quest_id > 0 && opt.node_id > 0 {
+                    GameCtxPb {
+                        CtxType: Some(GameCtxType::DoInteractChildQuestNode),
+                        CtxInfo: Some(GameCtxPbCtxInfoOneof::DoInteractChildQuestNode(
+                            DoInteractChildQuestNodeCtxPb {
+                                BehaviorTreeCtx: Some(BehaviorTreeCtxPb {
+                                    IncId: i64::from(opt.quest_id),
+                                    BtType: Some(opt.bt_type),
+                                    BtId: opt.quest_id,
+                                    NodeId: opt.node_id,
+                                }),
+                            },
+                        )),
+                    }
+                } else {
+                    GameCtxPb {
+                        CtxType: Some(GameCtxType::Entity),
+                        CtxInfo: Some(GameCtxPbCtxInfoOneof::Entity(entity_ctx.clone())),
+                    }
+                };
+                quest_engine::triggers::push_entity_level_events(
+                    &mut qctx,
+                    GameCtxType::DynamicInteract,
+                    GameCtxPbCtxInfoOneof::DynamicInteract(Box::new(DynamicInteractCtxPb {
+                        EntityCtx: Some(entity_ctx),
+                        OptionGuid: guid.as_bytes().to_vec(),
+                        finalOptionCtx: Some(final_option_ctx),
+                    })),
+                    &acts,
+                );
                 let prev_owner = if let Some(sc) = qctx.scene.as_deref_mut() {
                     let prev = sc.active_flow_owner_entity_id;
                     sc.active_flow_owner_entity_id = target_entity_id;
