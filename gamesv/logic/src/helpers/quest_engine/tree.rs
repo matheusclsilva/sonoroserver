@@ -6,6 +6,7 @@ use sonoro_gamesv_data::asset_indexes::entity_world_pos;
 use sonoro_gamesv_data::lazy_node_store::NodeEntry;
 use sonoro_gamesv_data::tables::quest_data::DataEntry as QuestDataEntry;
 use sonoro_gamesv_fs::quest_info::{ActiveQuest, append_unique_int, remove_int_value};
+use sonoro_gamesv_fs::role_info::RoleInfo;
 use sonoro_proto::enums::{
     BtType, ChildQuestNodeStatus, FailReason, GameCtxType, NodeStatus, QuestState, SuspendType,
 };
@@ -13,11 +14,13 @@ use sonoro_proto::pb::{
     BehaviorTreeInfoNotify, BtCancelRangeFailWarningNotify, BtRangeFailWarningNotify,
     BtRollbackInfo, BtRollbackInfoNotify, BtRollbackNotify, BtRollbackStartNotify,
     BtSuspendNotify, FailRollbackData, LowMemoryChangeSceneStartNotify, OccupationPbInfo,
-    OperationRestrictionNotify, QuestFinishListNotify, QuestListNotify, QuestRollBackEndNotify,
-    QuestShowListNotify, QuestInfo as PbQuestInfo, TraceQuestNotify, UpdateNodeStatusNotify,
+    OperationRestrictionNotify, PbRoleActiveNotify, QuestFinishListNotify, QuestListNotify,
+    QuestRollBackEndNotify, QuestShowListNotify, QuestInfo as PbQuestInfo, TraceQuestNotify,
+    UpdateNodeStatusNotify, WeaponItemAddNotify, roleInfo as PbRoleActiveInfo,
 };
 use sonoro_proto::wire::PbEnum;
 
+use crate::component::comp_util;
 use crate::helpers::condition;
 use crate::helpers::level_play::{self, LevelPlayContext};
 use crate::helpers::quest_actions;
@@ -26,7 +29,7 @@ use crate::helpers::quest_types::{
     subtree_wait_delay_ms,
 };
 use crate::helpers::reward;
-use crate::helpers::role;
+use crate::helpers::{role, role_stats, trial_roles};
 use crate::scene::now_millis;
 use crate::schedulers::quest_timer_queue::{QuestTimerEntry, QuestTimerQueue};
 use crate::sink::PushSink;
@@ -1354,7 +1357,7 @@ pub fn resume_child_quest_finish_actions<S: PushSink + ?Sized>(
         scene.child_finish_action_next_idx.remove(&akey);
     }
     if node.reward_id > 0 {
-        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), node.reward_id, 6003)?;
+        grant_quest_drop_package(ctx, node.reward_id)?;
     }
     ctx.quest_comp.info.mark_node_finished(quest_id, node.id);
     if push_updates {
@@ -1428,6 +1431,143 @@ fn run_child_quest_finish_segments<S: PushSink + ?Sized>(
     Ok(false)
 }
 
+/// Maps story `DropPackage` IDs whose client `DropPreview` is empty to their unlocked role ID.
+pub fn story_role_for_drop_package(drop_id: i32) -> Option<i32> {
+    match drop_id {
+        // 139000025 Node 155: Yangyang joins before Elite Abyssal Guard & switch tutorial (10043/10044)
+        30003 => Some(1402),
+        // 139000026 Node 16: Chixia joins at Jinzhou arrival before RoleDescription BoardId 1
+        30002 => Some(1202),
+        _ => None,
+    }
+}
+
+fn grant_story_role_drop<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    drop_id: i32,
+) -> io::Result<bool> {
+    let Some(role_id) = story_role_for_drop_package(drop_id) else {
+        return Ok(false);
+    };
+    let assets = ctx.assets;
+    let fs = ctx.fs;
+    let sink = &mut *ctx.sink;
+    let weapon_comp = &mut *ctx.weapon_comp;
+    let echo_comp = &*ctx.echo_comp;
+    let Some(role_comp) = ctx.role_comp.as_deref_mut() else {
+        return Ok(false);
+    };
+
+    let newly_unlocked = !role_comp.role_map.contains_key(&role_id);
+    if newly_unlocked {
+        let new_role = RoleInfo::create_default(assets, role_id).map_err(io::Error::other)?;
+        role_comp.role_map.insert(role_id, new_role.clone());
+        let role_path = format!("player/{}/role/{role_id}", role_comp.player_id);
+        comp_util::save_struct(fs, &new_role, &role_path)?;
+    }
+
+    if role::ensure_role_weapon(fs, assets, role_comp, weapon_comp, role_id).unwrap_or(false)
+        && let Some(rinfo) = role_comp.role_map.get(&role_id)
+        && let Some(witem) = weapon_comp.weapon_map.get(&rinfo.weapon)
+    {
+        sink.push(
+            WeaponItemAddNotify::MSG_ID,
+            &WeaponItemAddNotify {
+                WeaponItemList: vec![witem.to_proto(rinfo.weapon)],
+                AddFromRole: true,
+                Reason: 6003,
+            },
+        );
+    }
+
+    if newly_unlocked && let Some(rinfo) = role_comp.role_map.get(&role_id).cloned() {
+        let pb_role =
+            role_stats::to_client_role_info(assets, role_comp, role_id, &rinfo, weapon_comp, echo_comp)
+                .map_err(io::Error::other)?;
+        sink.push(
+            PbRoleActiveNotify::MSG_ID,
+            &PbRoleActiveNotify {
+                Role: Some(PbRoleActiveInfo {
+                    RoleId: pb_role.RoleId,
+                    Name: pb_role.Name,
+                    Level: pb_role.Level,
+                    Exp: pb_role.Exp,
+                    Breakthrough: pb_role.Breakthrough,
+                    Skills: pb_role.Skills,
+                    Phantom: pb_role.Phantom,
+                    Star: pb_role.Star,
+                    Favor: pb_role.Favor,
+                    Reson: pb_role.Reson,
+                    CurModel: pb_role.CurModel,
+                    Models: pb_role.Models,
+                    BaseProp: pb_role.BaseProp,
+                    AddProp: pb_role.AddProp,
+                    CreateTime: pb_role.CreateTime,
+                    SkillNodeState: pb_role.SkillNodeState,
+                    ResonantChainGroupIndex: pb_role.ResonantChainGroupIndex,
+                    SkinId: pb_role.SkinId,
+                    EnableSelfBgm: pb_role.EnableSelfBgm,
+                }),
+            },
+        );
+    }
+
+    if !ctx.quest_comp.info.env.pre_trial_roles.is_empty() {
+        if !ctx.quest_comp.info.env.pre_trial_roles.contains(&role_id)
+            && ctx.quest_comp.info.env.pre_trial_roles.len() < 3
+        {
+            ctx.quest_comp.info.env.pre_trial_roles.push(role_id);
+        }
+    } else if let Some(scene) = ctx.scene.as_deref_mut() {
+        let cur_idx = usize::try_from(scene.formation_info.cur_formation).unwrap_or(0);
+        if cur_idx < scene.formation_info.formations.len() {
+            let mut next_ids: Vec<i32> = scene.formation_info.formations[cur_idx]
+                .roles
+                .iter()
+                .flatten()
+                .map(|s| s.role_id)
+                .collect();
+            if !next_ids.contains(&role_id) && next_ids.len() < 3 {
+                next_ids.push(role_id);
+                let cur_role = scene.formation_info.formations[cur_idx].cur_role;
+                let desired_cur = if next_ids.contains(&cur_role) {
+                    cur_role
+                } else {
+                    next_ids[0]
+                };
+                trial_roles::sync_formation_entities(
+                    scene,
+                    fs,
+                    assets,
+                    sink,
+                    ctx.events,
+                    role_comp,
+                    weapon_comp,
+                    echo_comp,
+                    &next_ids,
+                    desired_cur,
+                )
+                .map_err(io::Error::other)?;
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn grant_quest_drop_package<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    drop_id: i32,
+) -> io::Result<()> {
+    if drop_id <= 0 {
+        return Ok(());
+    }
+    if !grant_story_role_drop(ctx, drop_id)? {
+        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), drop_id, 6003)?;
+    }
+    Ok(())
+}
+
 pub fn finish_non_child_node<S: PushSink + ?Sized>(
     ctx: &mut QuestContext<'_, S>,
     quest_id: i32,
@@ -1438,7 +1578,7 @@ pub fn finish_non_child_node<S: PushSink + ?Sized>(
         scene.release_occupations_for_node(quest_id, node.id);
     }
     if node.reward_id > 0 {
-        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), node.reward_id, 6003)?;
+        grant_quest_drop_package(ctx, node.reward_id)?;
     }
     if !ctx.quest_comp.info.has_active_quest(quest_id) {
         return Ok(());
@@ -2343,7 +2483,7 @@ pub fn succeed_quest<S: PushSink + ?Sized>(
     if let Some(ref q) = quest_opt
         && q.Data.RewardId > 0
     {
-        let _ = reward::grant_drop_package(&mut ctx.make_reward_context(), q.Data.RewardId, 6003)?;
+        grant_quest_drop_package(ctx, q.Data.RewardId)?;
     }
 
     ctx.quest_comp.info.finish_quest(quest_id);

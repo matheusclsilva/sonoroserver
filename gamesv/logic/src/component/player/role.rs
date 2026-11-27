@@ -3,6 +3,7 @@ use std::io;
 
 use sonoro_common::fs::FileSystem;
 use sonoro_gamesv_data::Assets;
+use sonoro_gamesv_data::zon_config::GameConfig;
 use sonoro_gamesv_fs::role_info::RoleInfo;
 
 use crate::component::comp_util::{self, FsStoreItem, StoreType};
@@ -13,7 +14,11 @@ impl FsStoreItem for RoleInfo {
     const DATA_DIR: &'static str = RoleInfo::DATA_DIR;
 
     fn add_defaults(assets: &Assets, map: &mut BTreeMap<i32, Self>) {
-        RoleInfo::add_defaults(assets, map);
+        if GameConfig::embedded().normal_progression {
+            RoleInfo::add_main_defaults(assets, map);
+        } else {
+            RoleInfo::add_defaults(assets, map);
+        }
     }
 }
 

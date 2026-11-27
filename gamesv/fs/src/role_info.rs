@@ -333,6 +333,17 @@ impl RoleInfo {
         Ok(role)
     }
 
+    pub fn add_main_defaults(assets: &Assets, map: &mut BTreeMap<i32, RoleInfo>) {
+        const MAIN_IDS: [i32; 2] = [1501, 1502];
+        for id in MAIN_IDS {
+            if assets.tables.role_info.get_data_by_id(&id).is_some()
+                && let Ok(role) = Self::create_default(assets, id)
+            {
+                map.insert(id, role);
+            }
+        }
+    }
+
     pub fn add_defaults(assets: &Assets, map: &mut BTreeMap<i32, RoleInfo>) {
         const STARTER_IDS: [i32; 5] = [1501, 1502, 1402, 1202, 1102];
         for id in STARTER_IDS {

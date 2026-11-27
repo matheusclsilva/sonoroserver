@@ -3,6 +3,7 @@ use std::io;
 
 use sonoro_common::fs::FileSystem;
 use sonoro_gamesv_data::Assets;
+use sonoro_gamesv_data::zon_config::GameConfig;
 use sonoro_gamesv_data::asset_indexes::{
     self, CellRange, entity_world_pos, entity_world_rot, is_spawnable_blueprint_and_template,
 };
@@ -74,7 +75,11 @@ fn ensure_valid_formation(
         } else {
             1502
         };
-        let starter_roles = [rover_id, 1402, 1202];
+        let starter_roles: &[i32] = if GameConfig::embedded().normal_progression {
+            &[rover_id]
+        } else {
+            &[rover_id, 1402, 1202]
+        };
         cur.cur_role = starter_roles[0];
         for (i, &role_id) in starter_roles.iter().enumerate() {
             cur.roles[i] = Some(FormationRole {

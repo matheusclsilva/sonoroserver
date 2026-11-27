@@ -8421,3 +8421,387 @@ fn audit_147_child_quest_finish_actions_pause_on_sync_play_flow() {
         "Quest 139000025 should finish once all sync PlayFlows in Node 159 complete"
     );
 }
+
+#[test]
+fn audit_148_prologue_story_role_drops_unlock_and_join_formation() {
+    use sonoro_gamesv_logic::helpers::role as role_helper;
+    use sonoro_gamesv_logic::templates::role_entity_templates;
+    use sonoro_proto::pb::{
+        PbRoleActiveNotify, UpdateGroupFormationNotify, WeaponItemAddNotify,
+    };
+
+    let mut h = TestHarness::new("audit148", Some(8));
+    let _ = h.drain_count();
+
+    // 1. Fresh account in normal_progression mode must start with ONLY [1501, 1502] in role_map.
+    let initial_roles: Vec<i32> = h
+        .state
+        .player_components
+        .role
+        .role_map
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(
+        initial_roles,
+        vec![1501, 1502],
+        "Fresh account should only pre-seed main roles [1501, 1502]"
+    );
+
+    // Seed Rover (1501) as the sole active formation member (matching sanitize_formation_for_login).
+    role_helper::ensure_role_weapon(
+        &h.state.fs,
+        &h.state.assets,
+        &mut h.state.player_components.role,
+        &mut h.state.player_components.weapon,
+        1501,
+    )
+    .expect("rover weapon");
+    let rover_net_id = {
+        let dun = h
+            .state
+            .assets
+            .tables
+            .instance_dungeon
+            .get_data_by_id(&8)
+            .expect("dungeon 8");
+        let sc = h.state.scene.as_mut().expect("scene");
+        let rover_ent = role_entity_templates::create_role_entity(
+            &h.state.fs,
+            sc,
+            1,
+            &h.state.assets,
+            &mut h.state.player_components.role,
+            &h.state.player_components.weapon,
+            &h.state.player_components.echo,
+            &dun,
+            1501,
+        )
+        .expect("spawn rover");
+        sc.formation_info.cur_formation = 0;
+        sc.formation_info.formations[0].cur_role = 1501;
+        sc.formation_info.formations[0].roles = [
+            Some(FormationRole {
+                role_id: 1501,
+                entity_id: rover_ent.net_id,
+                on_stage_without_control: false,
+            }),
+            None,
+            None,
+        ];
+        rover_ent.net_id
+    };
+
+    {
+        let mut evq = EventQueue::new();
+        let qctx = h.state.quest_context(&mut evq);
+        assert!(
+            quest_engine::triggers::matches_prologue_single_role_switch_guide(
+                &qctx,
+                139_000_025,
+                10043,
+            ),
+            "Before Yangyang joins, switch-role guide 10043 sees < 2 roles"
+        );
+    }
+
+    // 2. Finish Quest 139000025 Node 155 (RewardId 30003) -> unlocks Yangyang (1402) + joins slot 2.
+    let prologue_nodes = h
+        .state
+        .assets
+        .quest_nodes
+        .get_owner_nodes(139_000_025)
+        .expect("139000025 nodes");
+    let node155 = prologue_nodes
+        .iter()
+        .find(|n| n.id == 155)
+        .cloned()
+        .expect("Node 155");
+    h.state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: 139_000_025,
+            active_nodes: vec![155],
+            finished_nodes: Vec::new(),
+            killed_entities: Vec::new(),
+        });
+    let _ = h.drain_count();
+
+    let mut evq = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut evq);
+        quest_engine::tree::complete_child_quest(&mut qctx, 139_000_025, &prologue_nodes, &node155)
+            .expect("complete node 155");
+    }
+
+    let yy = h
+        .state
+        .player_components
+        .role
+        .role_map
+        .get(&1402)
+        .expect("Yangyang 1402 must unlock on RewardId 30003");
+    assert_ne!(yy.weapon, 0, "Yangyang must receive default starter weapon");
+    assert!(
+        h.state
+            .player_components
+            .weapon
+            .weapon_map
+            .contains_key(&yy.weapon),
+        "Yangyang's starter weapon must be persisted in weapon_map"
+    );
+
+    fn drain_raw(h: &mut TestHarness) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = h.rx.try_recv() {
+            if frame.len() >= 3
+                && let Ok(msg) = super::Message::decode(&frame[3..])
+            {
+                out.push((msg.header.message_id(), msg.payload));
+            }
+        }
+        out
+    }
+    fn of<M: sonoro_proto::PbMessage>(frames: &[(u16, Vec<u8>)], msg_id: u16) -> Vec<M> {
+        frames
+            .iter()
+            .filter(|(id, _)| *id == msg_id)
+            .filter_map(|(_, payload)| M::decode(payload).ok())
+            .collect()
+    }
+
+    let frames1 = drain_raw(&mut h);
+    let weapon_adds: Vec<WeaponItemAddNotify> = of(&frames1, WeaponItemAddNotify::MSG_ID);
+    let role_actives: Vec<PbRoleActiveNotify> = of(&frames1, PbRoleActiveNotify::MSG_ID);
+    let entity_adds: Vec<EntityAddNotify> = of(&frames1, EntityAddNotify::MSG_ID);
+    let grp_updates: Vec<UpdateGroupFormationNotify> =
+        of(&frames1, UpdateGroupFormationNotify::MSG_ID);
+
+    assert!(
+        weapon_adds.iter().any(|w| w.AddFromRole && !w.WeaponItemList.is_empty()),
+        "WeaponItemAddNotify(AddFromRole=true) expected for Yangyang"
+    );
+    assert_eq!(role_actives.len(), 1);
+    assert_eq!(role_actives[0].Role.as_ref().map(|r| r.RoleId), Some(1402));
+    assert!(
+        entity_adds
+            .iter()
+            .flat_map(|n| n.EntityPbs.iter())
+            .any(|pb| pb.ConfigId == 1402),
+        "EntityAddNotify must spawn Yangyang (1402)"
+    );
+    assert_eq!(grp_updates.len(), 1);
+    let fight_info = &grp_updates[0].GroupFormation[0].FightRoleInfos[0];
+    assert_eq!(fight_info.CurRole, 1501);
+    let grp_role_ids: Vec<i32> = fight_info
+        .FightRoleInfos
+        .iter()
+        .map(|r| r.RoleId)
+        .collect();
+    assert_eq!(grp_role_ids, vec![1501, 1402]);
+
+    let mut saw_update_formations = false;
+    while let Some(ev) = evq.dequeue() {
+        if let Event::UpdateFormations { role_ids, .. } = ev {
+            assert_eq!(role_ids, vec![1501, 1402]);
+            saw_update_formations = true;
+        }
+    }
+    assert!(saw_update_formations, "Event::UpdateFormations must be enqueued");
+
+    {
+        let mut check_evq = EventQueue::new();
+        let qctx = h.state.quest_context(&mut check_evq);
+        for gid in [10043, 10044] {
+            assert!(
+                !quest_engine::triggers::matches_prologue_single_role_switch_guide(
+                    &qctx,
+                    139_000_025,
+                    gid,
+                ),
+                "Guide {gid} must NOT auto-skip once Yangyang has joined slot 2"
+            );
+        }
+    }
+
+    // 3. Finish Quest 139000026 Node 16 (RewardId 30002) -> unlocks Chixia (1202) + joins slot 3.
+    let act1_nodes = h
+        .state
+        .assets
+        .quest_nodes
+        .get_owner_nodes(139_000_026)
+        .expect("139000026 nodes");
+    let node16 = act1_nodes
+        .iter()
+        .find(|n| n.id == 16)
+        .cloned()
+        .expect("Node 16");
+    h.state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: 139_000_026,
+            active_nodes: vec![16],
+            finished_nodes: Vec::new(),
+            killed_entities: Vec::new(),
+        });
+    let _ = h.drain_count();
+
+    let mut evq2 = EventQueue::new();
+    {
+        let mut qctx = h.state.quest_context(&mut evq2);
+        quest_engine::tree::complete_child_quest(&mut qctx, 139_000_026, &act1_nodes, &node16)
+            .expect("complete node 16");
+    }
+    while let Some(flow_inc_id) = h
+        .state
+        .scene
+        .as_ref()
+        .map(|s| s.active_flow_inc_id)
+        .filter(|&id| id != 0)
+    {
+        let mut qctx = h.state.quest_context(&mut evq2);
+        quest_engine::on_flow_end_with_options(&mut qctx, flow_inc_id, &BTreeMap::new(), false)
+            .expect("end node 16 sync flow");
+    }
+
+    let cx = h
+        .state
+        .player_components
+        .role
+        .role_map
+        .get(&1202)
+        .expect("Chixia 1202 must unlock on RewardId 30002");
+    assert_ne!(cx.weapon, 0, "Chixia must receive default starter weapon");
+
+    let frames2 = drain_raw(&mut h);
+    let role_actives2: Vec<PbRoleActiveNotify> = of(&frames2, PbRoleActiveNotify::MSG_ID);
+    let grp_updates2: Vec<UpdateGroupFormationNotify> =
+        of(&frames2, UpdateGroupFormationNotify::MSG_ID);
+    assert_eq!(role_actives2.len(), 1);
+    assert_eq!(role_actives2[0].Role.as_ref().map(|r| r.RoleId), Some(1202));
+    assert_eq!(grp_updates2.len(), 1);
+    let fight_info2 = &grp_updates2[0].GroupFormation[0].FightRoleInfos[0];
+    assert_eq!(fight_info2.CurRole, 1501);
+    let grp_role_ids2: Vec<i32> = fight_info2
+        .FightRoleInfos
+        .iter()
+        .map(|r| r.RoleId)
+        .collect();
+    assert_eq!(grp_role_ids2, vec![1501, 1402, 1202]);
+
+    // Rover original entity remains in slot 0.
+    let sc = h.state.scene.as_ref().expect("scene");
+    assert_eq!(
+        sc.formation_info.formations[0].roles[0]
+            .as_ref()
+            .map(|r| r.entity_id),
+        Some(rover_net_id)
+    );
+
+    // 4. Legacy-save check: 1402 already in role_map, only [1501] in formation ->
+    //    finishing node 155 must NOT emit duplicate PbRoleActiveNotify, MUST add 1402 to formation.
+    let mut legacy = TestHarness::new("audit148_legacy", Some(8));
+    let yy_legacy = RoleInfo::create_default(&legacy.state.assets, 1402).expect("1402");
+    legacy
+        .state
+        .player_components
+        .role
+        .role_map
+        .insert(1402, yy_legacy);
+    role_helper::ensure_role_weapon(
+        &legacy.state.fs,
+        &legacy.state.assets,
+        &mut legacy.state.player_components.role,
+        &mut legacy.state.player_components.weapon,
+        1501,
+    )
+    .expect("legacy rover weapon");
+    {
+        let dun = legacy
+            .state
+            .assets
+            .tables
+            .instance_dungeon
+            .get_data_by_id(&8)
+            .expect("dungeon 8");
+        let sc = legacy.state.scene.as_mut().expect("scene");
+        let rover_ent = role_entity_templates::create_role_entity(
+            &legacy.state.fs,
+            sc,
+            1,
+            &legacy.state.assets,
+            &mut legacy.state.player_components.role,
+            &legacy.state.player_components.weapon,
+            &legacy.state.player_components.echo,
+            &dun,
+            1501,
+        )
+        .expect("spawn legacy rover");
+        sc.formation_info.cur_formation = 0;
+        sc.formation_info.formations[0].cur_role = 1501;
+        sc.formation_info.formations[0].roles = [
+            Some(FormationRole {
+                role_id: 1501,
+                entity_id: rover_ent.net_id,
+                on_stage_without_control: false,
+            }),
+            None,
+            None,
+        ];
+    }
+    legacy
+        .state
+        .player_components
+        .quest
+        .info
+        .active_quests
+        .push(sonoro_gamesv_fs::quest_info::ActiveQuest {
+            quest_id: 139_000_025,
+            active_nodes: vec![155],
+            finished_nodes: Vec::new(),
+            killed_entities: Vec::new(),
+        });
+    let _ = legacy.drain_count();
+
+    {
+        let mut legacy_evq = EventQueue::new();
+        let mut qctx = legacy.state.quest_context(&mut legacy_evq);
+        quest_engine::tree::complete_child_quest(
+            &mut qctx,
+            139_000_025,
+            &prologue_nodes,
+            &node155,
+        )
+        .expect("complete node 155 on legacy save");
+    }
+
+    let frames3 = drain_raw(&mut legacy);
+    let legacy_active: Vec<PbRoleActiveNotify> = of(&frames3, PbRoleActiveNotify::MSG_ID);
+    let legacy_adds: Vec<EntityAddNotify> = of(&frames3, EntityAddNotify::MSG_ID);
+    let legacy_grps: Vec<UpdateGroupFormationNotify> =
+        of(&frames3, UpdateGroupFormationNotify::MSG_ID);
+    assert!(
+        legacy_active.is_empty(),
+        "Already-owned role must not re-emit PbRoleActiveNotify"
+    );
+    assert!(
+        legacy_adds
+            .iter()
+            .flat_map(|n| n.EntityPbs.iter())
+            .any(|pb| pb.ConfigId == 1402),
+        "Legacy save must still spawn Yangyang (1402) entity into active squad"
+    );
+    assert_eq!(legacy_grps.len(), 1);
+    let legacy_ids: Vec<i32> = legacy_grps[0].GroupFormation[0].FightRoleInfos[0]
+        .FightRoleInfos
+        .iter()
+        .map(|r| r.RoleId)
+        .collect();
+    assert_eq!(legacy_ids, vec![1501, 1402]);
+}
