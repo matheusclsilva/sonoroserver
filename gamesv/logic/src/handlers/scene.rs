@@ -2116,6 +2116,71 @@ fn consider_spawn_candidates(
     }
 }
 
+/// Teleporter-table entities (beacons, nexuses, entrances) of the map that are inside the client
+/// AOI and pass the usual spawn filters. The client keeps every server entity inside its AOI
+/// (2D distance below `AoiXyLayerValues[AoiLayer]`, no Z limit for AoiZRadius 0), which for
+/// Teleport001 is 240 m, past the 200 m 3D spawn scan; in a full town scene the nearer clutter
+/// would also take every slot. Only entities the spawn index lists for their cell are used.
+#[allow(clippy::too_many_arguments)]
+fn teleporters_in_client_aoi(
+    assets: &Assets,
+    scene: &Scene,
+    quest_info: &QuestInfo,
+    eval_ctx: &EvalContext<'_>,
+    active_quest_targets: &HashSet<i32>,
+    now_ms: i64,
+    player_loc: [f32; 3],
+    map_id: i32,
+) -> Vec<SpawnCandidate> {
+    let mut indices = Vec::new();
+    for &tp_idx in assets.indexes.teleporter_indices_for_map(map_id) {
+        let tp = &assets.tables.teleporter.items[tp_idx as usize];
+        for &cfg_idx in assets.indexes.level_entity_indices_by_id(tp.TeleportEntityConfigId) {
+            let Some(cfg) = assets.get_level_entity_by_idx(cfg_idx) else {
+                continue;
+            };
+            if cfg.MapId != map_id {
+                continue;
+            }
+            let Some(pos) = entity_world_pos(&cfg) else {
+                continue;
+            };
+            if !in_client_aoi(assets, &cfg, pos, player_loc) {
+                continue;
+            }
+            let listed = asset_indexes::spatial_cell_range(pos[0], pos[1], 0.0).is_some_and(|c| {
+                (c.min_x..=c.max_x).any(|cx| {
+                    (c.min_y..=c.max_y).any(|cy| {
+                        assets
+                            .indexes
+                            .spawnable_indices_for_map_cell(map_id, cx, cy)
+                            .contains(&cfg_idx)
+                    })
+                })
+            });
+            if listed {
+                indices.push(cfg_idx);
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    consider_spawn_candidates(
+        assets,
+        scene,
+        quest_info,
+        eval_ctx,
+        active_quest_targets,
+        now_ms,
+        player_loc,
+        f32::INFINITY,
+        &indices,
+        &mut buf,
+        &mut Vec::new(),
+        0,
+    );
+    buf
+}
+
 pub fn is_blocked_world_entity_config(
     assets: &Assets,
     quest_info: &QuestInfo,
@@ -2420,6 +2485,19 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
         );
     }
 
+    let teleporter_buf = teleporters_in_client_aoi(
+        assets,
+        scene,
+        &quest_comp.info,
+        &eval_ctx,
+        &active_quest_targets,
+        now_ms,
+        player_loc,
+        map_id,
+    );
+    priority_buf.retain(|c| !teleporter_buf.iter().any(|t| t.cfg_idx == c.cfg_idx));
+    best_buf.retain(|c| !teleporter_buf.iter().any(|t| t.cfg_idx == c.cfg_idx));
+
     if priority_buf.len() + best_buf.len() > SCENE_ENTITY_CAP.saturating_sub(scene.entities.len()) {
         make_room_for_candidates(
             scene,
@@ -2434,9 +2512,10 @@ fn spawn_nearby_world_entities<S: PushSink + ?Sized>(
     }
 
     let mut pending = Vec::new();
-    for pool in [priority_buf, best_buf] {
+    // Teleporters inside the client AOI spawn past the cap, like level plays and quest targets.
+    for (past_cap, pool) in [(true, teleporter_buf), (false, priority_buf), (false, best_buf)] {
         for cand in pool {
-            if scene.entities.len() >= SCENE_ENTITY_CAP {
+            if !past_cap && scene.entities.len() >= SCENE_ENTITY_CAP {
                 break;
             }
             let Some(cfg) = assets.get_level_entity_by_idx(cand.cfg_idx) else {

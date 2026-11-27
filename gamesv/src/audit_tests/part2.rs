@@ -9066,3 +9066,104 @@ fn audit_150_destroyed_destructible_pays_its_reward_once() {
     );
     assert_eq!(h.state.player_components.basic.info.attributes.coin, coins_before);
 }
+
+#[test]
+fn audit_151_full_town_scene_spawns_teleporters_inside_client_aoi() {
+    use sonoro_gamesv_data::asset_indexes::entity_world_pos;
+    use sonoro_proto::wire::PbMessage;
+
+    // 2026-11-26 new-account run: in Jinzhou at (-27873, 125467, 11777) none of the nearby
+    // Teleport001 beacons reached the client. Teleport001 has AoiLayer 1 (24000 in the client's
+    // AoiXyLayerValues) and AoiZRadius 0 (no Z limit), so the client expects them up to 240 m in
+    // 2D. 109005326 is 163 m away in 2D but 265 m in 3D (past the 200 m spawn scan); 109002092 is
+    // 190 m away; 109002091 is 261 m away, outside its AOI.
+    const PLAYER: [f32; 3] = [-27_873.0, 125_467.0, 11_777.0];
+    const ABOVE_SCAN: i32 = 109_005_326;
+    const IN_AOI: i32 = 109_002_092;
+    const OUT_OF_AOI: i32 = 109_002_091;
+
+    let mut h = TestHarness::new("audit151", Some(8));
+    let mut events = EventQueue::new();
+    let assets = Arc::clone(&h.state.assets);
+    let xy = |p: [f32; 3]| ((p[0] - PLAYER[0]).powi(2) + (p[1] - PLAYER[1]).powi(2)).sqrt();
+    for (id, lo, hi) in [(ABOVE_SCAN, 0.0, 24_000.0), (IN_AOI, 0.0, 24_000.0), (OUT_OF_AOI, 24_000.0, 1e9)] {
+        let cfg = assets.find_level_entity(8, i64::from(id)).expect("beacon");
+        assert_eq!(cfg.BlueprintType, "Teleport001");
+        let d = xy(entity_world_pos(&cfg).expect("pos"));
+        assert!((lo..hi).contains(&d), "{id} is {d} away in 2D");
+    }
+
+    // Fill the scene to the cap with level entities 20 m from the player, all inside their own
+    // client AOI (AoiLayer 0/6/7: 60/30/90 m): the town clutter a farther beacon cannot evict.
+    let mut placed = 0;
+    for &idx in assets.indexes.spawnable_indices_for_map(8) {
+        if placed == 240 {
+            break;
+        }
+        let Some(cfg) = assets.get_level_entity_by_idx(idx) else {
+            continue;
+        };
+        let Ok(id) = i32::try_from(cfg.EntityId) else {
+            continue;
+        };
+        if cfg.BlueprintType.contains("Teleport") || cfg.BlueprintType.contains("Treasure") {
+            continue;
+        }
+        let layer = cfg
+            .ComponentsData
+            .BaseInfoComponent
+            .as_ref()
+            .and_then(|bi| bi.AoiLayer)
+            .or_else(|| {
+                assets
+                    .find_template_config(&cfg.BlueprintType)
+                    .and_then(|t| t.ComponentsData.BaseInfoComponent.as_ref().and_then(|bi| bi.AoiLayer))
+            })
+            .unwrap_or(0);
+        if !matches!(layer, 0 | 7) {
+            continue;
+        }
+        let nid = spawn_level_entity(&mut h, id, EntityType::SceneItem);
+        let sc = h.state.scene.as_mut().unwrap();
+        sc.entity_mut(nid).unwrap().position.as_mut().unwrap().location =
+            [PLAYER[0] + 2_000.0, PLAYER[1], PLAYER[2]];
+        placed += 1;
+    }
+    {
+        let sc = h.state.scene.as_mut().unwrap();
+        assert_eq!(sc.entities.len(), 240);
+        sc.instance.players = vec![ScenePlayer {
+            id: h.state.player_id,
+            group_type: 1,
+            location: PLAYER,
+            rotation: [0.0; 3],
+        }];
+    }
+    let _ = h.drain_count();
+
+    events.enqueue(Event::SpatialSpawnsCheck {
+        player_id: h.state.player_id,
+    });
+    while let Some(ev) = events.dequeue() {
+        let mut rt = h.state.as_runtime(&mut events, None);
+        sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+    }
+    let frames = drain_push_frames(&mut h);
+    let added: Vec<i32> = frames
+        .iter()
+        .filter(|(id, _)| *id == EntityAddNotify::MSG_ID)
+        .flat_map(|(_, p)| EntityAddNotify::decode(p).unwrap().EntityPbs)
+        .map(|e| e.ConfigId)
+        .collect();
+    let sc = h.state.scene.as_ref().unwrap();
+    for id in [ABOVE_SCAN, IN_AOI] {
+        assert!(
+            sc.find_entity_net_id_by_config_id(id).is_some() && added.contains(&id),
+            "beacon {id} inside the client AOI must spawn and reach the client"
+        );
+    }
+    assert!(
+        sc.find_entity_net_id_by_config_id(OUT_OF_AOI).is_none(),
+        "beacon {OUT_OF_AOI} is outside its 240 m AOI"
+    );
+}
