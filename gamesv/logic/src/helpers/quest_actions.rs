@@ -11,32 +11,35 @@ use sonoro_gamesv_fs::inventory_info::InventoryInfo;
 use sonoro_gamesv_fs::last_scene_info::LastSceneInfo;
 use sonoro_gamesv_fs::quest_info::{QuestInfo, append_unique_int, append_unique_str, remove_int_value, remove_str_value};
 use sonoro_proto::enums::{
-    BtType, ChangeReason, ERemoveEntityType, ExitVehicleType, GameCtxType, GravityFlipType,
-    IllustratedType, LiftMoveType, MoveStatus, SuspendType, TeleportReason,
+    ActionInfrastructureItemDeliveryType, ActionOpenSystemType, BtType, ChangeReason,
+    ERemoveEntityType, ExitVehicleType, GameCtxType, GravityFlipType, IllustratedType,
+    LiftMoveType, MoveStatus, SuspendType, TeleportReason,
 };
 use sonoro_proto::pb::{
-    AddGuestNotify, AlertArea, AlertAreaNotify, AudioStatePb, AudioStateUpdateNotify,
-    BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify, CommonTagData, ElevatorMoveNotify,
-    EnableNearbyTrackingNotify, EntityAddBubbleNotify, EntityAddDynamicInteractNotify, EntityCommonTagNotify, EntityCtxPb,
-    EntityPosResetNotify, EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify,
-    EntityRemoveInfo, EntityRemoveNotify, EntityStateReadyNotify, FlowActionCtxPb,
+    ActionOpenSystemBoardNotify, ActionOpenSystemParam, AddGuestNotify, AlertArea, AlertAreaNotify,
+    AudioStatePb, AudioStateUpdateNotify, BehaviorTreeCtxPb, BtSuspendNotify, BtVarUpdateNotify,
+    CommonTagData, ElevatorMoveNotify, EnableNearbyTrackingNotify, EntityAddBubbleNotify,
+    EntityAddDynamicInteractNotify, EntityCommonTagNotify, EntityCtxPb, EntityPosResetNotify,
+    EntityRemoveBubbleNotify, EntityRemoveDynamicInteractNotify, EntityRemoveInfo,
+    EntityRemoveNotify, EntityStateReadyNotify, FishingHandInData, FlowActionCtxPb,
     FlowShowEntityNotify, GameCtxPb, GameCtxPbCtxInfoOneof, GameplayCueNotify,
-    GravityFlipUpdateTypeNotify, IllustratedEntry, IllustratedUnlockNotify, InstanceTimer,
-    InstanceTimerNotify, InstResultNotify, InstSettleNotify, LeaveSceneNotify,
-    LevelPlayStateNotify, LiftMoveTypeCustomSpeedPb, LiftMoveTypeDefaultPb, LiftMoveTypePb,
-    LiftMoveTypeTeleportPb, MailInfosNotify, MapMarkShowIdInfoUpdateNotify, ModifyEntityCampNotify,
+    GiantSystemBoardData, GravityFlipUpdateTypeNotify, GreatSwordChallengeData, IllustratedEntry,
+    IllustratedUnlockNotify, InfrHandInData, InstanceTimer, InstanceTimerNotify, InstResultNotify,
+    InstSettleNotify, LeaveSceneNotify, LevelPlayStateNotify, LiftMoveTypeCustomSpeedPb,
+    LiftMoveTypeDefaultPb, LiftMoveTypePb, LiftMoveTypeTeleportPb, MailInfosNotify,
+    MapMarkShowIdInfoUpdateNotify, ModifyEntityCampNotify, MotorRaceChallengeData,
     MovePackageNotify, MoveReplaySample, MoveSplineConfig, MoveSplineConfigEndPointOneof,
     MoveSplineConfigLookDirOneof, MoveSplineConfigStartPointOneof, MoveSplineStatusNotify,
-    MovingEntityData, NormalItem, NormalItemUpdateNotify, OccupationPbInfo,
+    MovingEntityData, NormalItem, NormalItemUpdateNotify, OccupationPbInfo, OpenSystemBoardData,
     OperationRestrictionNotify, PlayerReviveNotify, PlayerVarNotify, RemoveGuestNotify,
     RoleTrialCloseNotify, RoleTrialOpenNotify, Rotator, RoverRogueRoomInfoNotify, SceneAreaState,
     SceneAreaStateNotify, SceneChangeDataLayerNotify, SceneItemMoveTargetInfo,
     SceneItemMoveTargetNotify, SceneItemSplineRuntimeData, SceneSubLevelsChangedNotify,
-    SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify, StateChangeActionCtxPb,
-    SummonEntityNotify,
-    SyncSceneTimeNotify, TeleportNotify, TeleportUpdateNotify, TemporaryTeleportAllInfoNotify,
-    TimeLockInfoNotify, TrialRoleItem, VarDefinePb, VarDefinePbValueOneof, Vector,
-    VehicleUpdateEntityNotify, VehicleUpdateNotify, WeatherNotify,
+    SceneTimeInfo, ShortMessageInfo, ShortMessageUpdateNotify, SoaringChallengeData,
+    StateChangeActionCtxPb, SummonEntityNotify, SyncSceneTimeNotify, TeleportNotify,
+    TeleportUpdateNotify, TemporaryTeleportAllInfoNotify, TimeLockInfoNotify, TrialRoleItem,
+    VarDefinePb, VarDefinePbValueOneof, Vector, VehicleUpdateEntityNotify, VehicleUpdateNotify,
+    WeatherNotify,
 };
 use sonoro_proto::wire::PbEnum;
 
@@ -58,7 +61,9 @@ use crate::helpers::quest_types::{
 };
 use crate::helpers::reward::{self, RewardItem};
 use crate::helpers::{gameplay_tags, gravity, map as map_helper, morale, prologue_quest, spline_state, trial_roles};
-use crate::scene::{DynamicInteractKind, Scene, StateTagUpdate, now_millis};
+use crate::scene::{
+    DynamicInteractKind, PendingSystemBoard, Scene, StateTagUpdate, now_millis,
+};
 use crate::sink::PushSink;
 
 fn now_unix_secs() -> i64 {
@@ -772,16 +777,13 @@ pub fn execute_action<S: PushSink + ?Sized>(
         "GiantTriggerResponse" => {
             record_progress_claim(ctx, "giant_trigger:active")?;
         }
-        "OpenSystemBoard" | "OpenSystemBoardWithReturn" | "OpenSimpleGameplay" => {
+        "OpenSystemBoardWithReturn" => {
+            apply_open_system_board_with_return(ctx, quest_id, params)?;
+        }
+        "OpenSystemBoard" | "OpenSimpleGameplay" => {
             if let Some(st) = params.get("SystemType").and_then(Value::as_object) {
                 if let Some(bid) = json_int(st.get("Id")) {
                     record_progress_int(ctx, &format!("system_board:{bid}"), 1, false)?;
-                }
-                if let Some(rv) = st.get("ReturnVar").and_then(Value::as_object)
-                    && let Some(vname) = json_str(rv.get("Name"))
-                {
-                    ctx.quest_comp.info.set_var_int(vname, 1);
-                    ctx.quest_comp.save(ctx.fs)?;
                 }
             } else if let Some(bid) = json_int(params.get("BoardId")) {
                 record_progress_int(ctx, &format!("system_board:{bid}"), 1, false)?;
@@ -3644,6 +3646,138 @@ fn persist_global_var_str<S: PushSink + ?Sized>(
         pc.info.set_key_str(&format!("var:{name}"), val);
         let _ = pc.save(ctx.fs);
     }
+}
+
+fn apply_open_system_board_with_return<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    owner_id: i32,
+    params: &Map<String, Value>,
+) -> io::Result<()> {
+    let Some(st) = params.get("SystemType").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let st_type = json_str(st.get("Type")).unwrap_or("ConfirmBox");
+    let inc_id = ctx
+        .scene
+        .as_deref_mut()
+        .map_or(1, Scene::alloc_action_inc_id);
+    let mut param = ActionOpenSystemParam {
+        IncId: inc_id,
+        ..Default::default()
+    };
+    match st_type {
+        "ConfirmBox" | "ConfirmBox2" => {
+            let board_id = json_int(st.get("Id")).unwrap_or(0);
+            record_progress_int(ctx, &format!("system_board:{board_id}"), 1, false)?;
+            param.ActionOpenType = Some(ActionOpenSystemType::ActionOpenSystem);
+            param.OpenSystemBoardData = Some(OpenSystemBoardData { BoardId: board_id });
+        }
+        "SoaringChallenge" => {
+            param.ActionOpenType = Some(ActionOpenSystemType::SoaringChallenge);
+            param.SoaringChallengeData = Some(SoaringChallengeData {
+                Score: json_int(st.get("Score")).unwrap_or(0),
+                RankS: json_int(st.get("RankS")).unwrap_or(0),
+                RankA: json_int(st.get("RankA")).unwrap_or(0),
+                RankB: json_int(st.get("RankB")).unwrap_or(0),
+            });
+        }
+        "FishingItemDelivery" => {
+            param.ActionOpenType = Some(ActionOpenSystemType::FishingHandIn);
+            param.FishingHandInData = Some(FishingHandInData {
+                HandInId: json_int(st.get("PresetId")).unwrap_or(0),
+            });
+        }
+        "GreatSwordChallenge" => {
+            param.ActionOpenType = Some(ActionOpenSystemType::GreatSwordChallenge);
+            param.GreatSwordChallengeData = Some(GreatSwordChallengeData {
+                Id: json_int(st.get("Id")).unwrap_or(0),
+            });
+        }
+        "InfrastructureItemDelivery" => {
+            let delivery_ty = match json_str(st.get("DeliveryType")) {
+                Some("Road") => ActionInfrastructureItemDeliveryType::Road,
+                _ => ActionInfrastructureItemDeliveryType::Observatory,
+            };
+            param.ActionOpenType = Some(ActionOpenSystemType::InfrHandIn);
+            param.InfrHandInData = Some(InfrHandInData {
+                Type: Some(delivery_ty),
+                Id: json_int(st.get("Id")).unwrap_or(0),
+            });
+        }
+        "MotorRaceChallenge" => {
+            param.ActionOpenType = Some(ActionOpenSystemType::MotorRaceChallenge);
+            param.MotorRaceChallengeData = Some(MotorRaceChallengeData {
+                Score: json_int(st.get("Score")).unwrap_or(0),
+                RankS: json_int(st.get("RankS")).unwrap_or(0),
+                RankA: json_int(st.get("RankA")).unwrap_or(0),
+                RankB: json_int(st.get("RankB")).unwrap_or(0),
+            });
+        }
+        "GiantDelivery" => {
+            param.ActionOpenType = Some(ActionOpenSystemType::GiantSystem);
+            param.GiantSystemBoardData = Some(GiantSystemBoardData {
+                GiantEcoType: json_int(st.get("EcoType")).unwrap_or(0),
+            });
+        }
+        _ => {
+            let board_id = json_int(st.get("Id")).unwrap_or(0);
+            param.ActionOpenType = Some(ActionOpenSystemType::ActionOpenSystem);
+            param.OpenSystemBoardData = Some(OpenSystemBoardData { BoardId: board_id });
+        }
+    }
+
+    if let Some(rv) = st.get("ReturnVar").and_then(Value::as_object)
+        && let Some(base_name) = resolve_var_name(rv)
+        && let Some(scene) = ctx.scene.as_deref_mut()
+    {
+        let is_global = json_str(rv.get("Source")) == Some("Global");
+        let store_key = if !is_global {
+            scoped_var_key_with_owner(Some(scene), owner_id, rv, base_name)
+                .unwrap_or_else(|| base_name.to_string())
+        } else {
+            base_name.to_string()
+        };
+        scene.pending_system_boards.push(PendingSystemBoard {
+            inc_id,
+            owner_id,
+            store_key,
+            var_name: base_name.to_string(),
+            is_global,
+        });
+    }
+
+    ctx.sink.push(
+        ActionOpenSystemBoardNotify::MSG_ID,
+        &ActionOpenSystemBoardNotify {
+            PlayerId: ctx.basic_comp.player_id,
+            Param: Some(param),
+        },
+    );
+    Ok(())
+}
+
+pub fn apply_system_board_return_var<S: PushSink + ?Sized>(
+    ctx: &mut QuestContext<'_, S>,
+    callbacks: &mut ActionCallbacks<'_, S>,
+    pending: &PendingSystemBoard,
+    result: i32,
+) -> io::Result<()> {
+    ctx.quest_comp.info.set_var_int(&pending.store_key, result);
+    if pending.is_global {
+        persist_global_var_int(ctx, &pending.var_name, i64::from(result));
+    }
+    ctx.quest_comp.save(ctx.fs)?;
+    emit_var_changed(
+        ctx,
+        callbacks,
+        pending.owner_id,
+        &pending.var_name,
+        VarDefinePb {
+            VarType: 1,
+            Value: Some(VarDefinePbValueOneof::Int(i64::from(result))),
+        },
+        pending.is_global,
+    )
 }
 
 fn apply_set_var<S: PushSink + ?Sized>(

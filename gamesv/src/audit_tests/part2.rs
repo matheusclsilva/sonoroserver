@@ -7279,3 +7279,156 @@ fn audit_139_change_lift_target_drives_rise_fall_and_completes_city_hall_quest()
         "expected EntityCommonTagNotify restoring 关卡.电梯.停靠 on floor 2 arrival"
     );
 }
+
+#[test]
+fn audit_140_open_system_board_with_return_notifies_client_and_records_result_on_response() {
+    use sonoro_gamesv_logic::helpers::quest_actions;
+    use sonoro_gamesv_logic::helpers::quest_engine;
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::enums::ActionOpenSystemType;
+    use sonoro_proto::pb::{
+        ActionOpenSystemBoardNotify, BtVarUpdateNotify, OpenSystemBoardResultRequest,
+        VarDefinePbValueOneof,
+    };
+
+    const QUEST_ID: i32 = 147_000_005;
+    let mut h = TestHarness::new("audit140", Some(8));
+    let _ = h.drain_count();
+
+    let run_board = |h: &mut TestHarness| {
+        let mut evq = EventQueue::new();
+        let act = serde_json::json!({
+            "Name": "OpenSystemBoardWithReturn",
+            "Params": {
+                "SystemType": {
+                    "Type": "ConfirmBox",
+                    "Id": 211,
+                    "ReturnVar": { "Type": "Int", "Source": "Self", "Name": "longxinqueren" }
+                }
+            }
+        });
+        {
+            let mut qctx = h.state.quest_context(&mut evq);
+            let mut cbs = quest_engine::action_callbacks();
+            quest_actions::execute_action(&mut qctx, &mut cbs, QUEST_ID, 1, &act)
+                .expect("OpenSystemBoardWithReturn");
+        }
+        while let Some(ev) = evq.dequeue() {
+            let mut rt = h.state.as_runtime(&mut evq, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("dispatch");
+        }
+    };
+
+    let drain_board_and_vars =
+        |h: &mut TestHarness| -> (Vec<ActionOpenSystemBoardNotify>, Vec<BtVarUpdateNotify>) {
+            let mut boards = Vec::new();
+            let mut vars = Vec::new();
+            while let Ok(frame) = h.rx.try_recv() {
+                if frame.len() < 3 {
+                    continue;
+                }
+                if let Ok(msg) = super::Message::decode(&frame[3..]) {
+                    if msg.header.message_id() == ActionOpenSystemBoardNotify::MSG_ID
+                        && let Ok(b) = ActionOpenSystemBoardNotify::decode(&msg.payload)
+                    {
+                        boards.push(b);
+                    } else if msg.header.message_id() == BtVarUpdateNotify::MSG_ID
+                        && let Ok(v) = BtVarUpdateNotify::decode(&msg.payload)
+                    {
+                        vars.push(v);
+                    }
+                }
+            }
+            (boards, vars)
+        };
+
+    // 1. Trigger OpenSystemBoardWithReturn: must push ActionOpenSystemBoardNotify and NOT pre-set ReturnVar.
+    run_board(&mut h);
+    let (boards, vars) = drain_board_and_vars(&mut h);
+    assert_eq!(boards.len(), 1);
+    let param = boards[0].Param.as_ref().expect("Param");
+    assert_eq!(param.ActionOpenType, Some(ActionOpenSystemType::ActionOpenSystem));
+    assert_eq!(
+        param.OpenSystemBoardData.as_ref().map(|d| d.BoardId),
+        Some(211)
+    );
+    assert!(param.IncId > 0);
+    assert!(vars.is_empty(), "ReturnVar must not be set before player responds");
+    assert!(
+        !h.state
+            .player_components
+            .quest
+            .info
+            .vars
+            .iter()
+            .any(|v| v.key == format!("Self:{QUEST_ID}:longxinqueren")),
+        "ReturnVar must not be set before player responds"
+    );
+
+    // 2. Player chooses Cancel (Result = 0): ReturnVar becomes 0 and BtVarUpdateNotify is pushed.
+    let player_id = h.state.player_id;
+    let inc_cancel = param.IncId;
+    let resp = crate::network::handlers::events_misc::handle_open_system_board_result_request(
+        &mut h.state,
+        OpenSystemBoardResultRequest {
+            IncId: inc_cancel,
+            PlayerId: player_id,
+            Result: 0,
+        },
+    )
+    .expect("cancel board result");
+    assert_eq!(resp.Code, Some(ErrorCode::Success));
+    let (_, vars) = drain_board_and_vars(&mut h);
+    assert!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .vars
+            .iter()
+            .any(|v| v.key == format!("Self:{QUEST_ID}:longxinqueren") && v.int_val == 0),
+        "ReturnVar must be recorded as 0 on Cancel"
+    );
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_var_int(&format!("Self:{QUEST_ID}:longxinqueren")),
+        0
+    );
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].TreeOwnerId, QUEST_ID);
+    assert_eq!(
+        vars[0].VarDefine.as_ref().and_then(|d| d.Value.as_ref()),
+        Some(&VarDefinePbValueOneof::Int(0))
+    );
+
+    // 3. Re-open and choose Confirm (Result = 1): ReturnVar becomes 1.
+    run_board(&mut h);
+    let (boards, _) = drain_board_and_vars(&mut h);
+    let inc_ok = boards[0].Param.as_ref().unwrap().IncId;
+    assert_ne!(inc_ok, inc_cancel);
+    crate::network::handlers::events_misc::handle_open_system_board_result_request(
+        &mut h.state,
+        OpenSystemBoardResultRequest {
+            IncId: inc_ok,
+            PlayerId: player_id,
+            Result: 1,
+        },
+    )
+    .expect("confirm board result");
+    let (_, vars) = drain_board_and_vars(&mut h);
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_var_int(&format!("Self:{QUEST_ID}:longxinqueren")),
+        1
+    );
+    assert_eq!(
+        vars[0].VarDefine.as_ref().and_then(|d| d.Value.as_ref()),
+        Some(&VarDefinePbValueOneof::Int(1))
+    );
+}

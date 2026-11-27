@@ -2300,6 +2300,20 @@ pub fn handle_open_system_board_result_request(
         i64::from(req.Result),
     )
     .map_err(|e| e.to_string())?;
+    if let Some(pending) = state
+        .scene
+        .as_mut()
+        .and_then(|s| s.take_pending_system_board(req.IncId))
+    {
+        let mut events = EventQueue::new();
+        {
+            let mut qctx = state.quest_context(&mut events);
+            let mut cbs = quest_engine::action_callbacks();
+            quest_actions::apply_system_board_return_var(&mut qctx, &mut cbs, &pending, req.Result)
+                .map_err(|e| e.to_string())?;
+        }
+        drain_event_queue_best_effort(&mut events, state);
+    }
     Ok(OpenSystemBoardResultResponse {
         Code: Some(ErrorCode::Success),
     })

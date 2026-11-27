@@ -145,6 +145,15 @@ pub struct ScenePendingFlow {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingSystemBoard {
+    pub inc_id: i32,
+    pub owner_id: i32,
+    pub store_key: String,
+    pub var_name: String,
+    pub is_global: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct BtOccupation {
     pub bt_type: BtType,
     pub owner_id: i32,
@@ -258,6 +267,7 @@ pub struct Scene {
     /// Role of the Echo group the client switched to (SwitchRoleRequest); 0 = the battle role.
     pub phantom_cur_role: i32,
     pub pending_flows: Vec<ScenePendingFlow>,
+    pub pending_system_boards: Vec<PendingSystemBoard>,
     pub quest_timers: QuestTimerQueue,
     pub lp_timers: QuestTimerQueue,
     pub fail_timers: QuestTimerQueue,
@@ -353,6 +363,7 @@ impl Scene {
             phantom_role_entity_ids: Vec::new(),
             phantom_cur_role: 0,
             pending_flows: Vec::new(),
+            pending_system_boards: Vec::new(),
             quest_timers: QuestTimerQueue::new(),
             lp_timers: QuestTimerQueue::new(),
             fail_timers: QuestTimerQueue::new(),
@@ -1125,6 +1136,14 @@ impl Scene {
         let id = self.next_action_inc_id;
         self.next_action_inc_id = if id == i32::MAX { 1 } else { id + 1 };
         id
+    }
+
+    pub fn take_pending_system_board(&mut self, inc_id: i32) -> Option<PendingSystemBoard> {
+        let pos = self
+            .pending_system_boards
+            .iter()
+            .position(|b| b.inc_id == inc_id)?;
+        Some(self.pending_system_boards.swap_remove(pos))
     }
 
     pub fn set_entity_visibility(

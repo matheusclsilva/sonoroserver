@@ -1684,7 +1684,6 @@ const CLIENT_EXECUTABLE_BT_ACTIONS: &[&str] = &[
     "OpenQuickHackSystem",
     "OpenSimpleGameplay",
     "OpenSystemBoard",
-    "OpenSystemBoardWithReturn",
     "OverrideAiBehaviorTree",
     "PhoneSystemInteract",
     "PlayBubble",
