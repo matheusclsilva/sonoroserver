@@ -4261,7 +4261,10 @@ fn apply_fire_bullet<S: PushSink + ?Sized>(
         _ => self_nid,
     };
     let (owner, bullet_id, target, location) = if name == "FireBulletEffect" {
-        let Some(owner) = self_nid else {
+        // Launcher is EBulletLauncher (Aki.TDConfigMgr): Player = 0, the default, or
+        // SceneItem = 1, the entity running the action.
+        let launcher = params.get("Launcher").and_then(Value::as_i64).unwrap_or(0);
+        let Some(owner) = (if launcher == 1 { self_nid } else { role_nid }) else {
             return;
         };
         let base = scene

@@ -9356,4 +9356,15 @@ fn audit_154_fire_bullet_actions_push_create_bullet_notify() {
     assert_eq!((b.OwnerEntityId, b.BulletId), (owner_nid, 200_200_001));
     let loc = b.Location.as_ref().expect("offset location");
     assert_eq!((loc.X, loc.Y, loc.Z), (350.0, 200.0, 600.0));
+
+    // Without Launcher (EBulletLauncher Player, the default; 5 data rows) the player launches.
+    run(&mut h, &mut events, r#"{"Name":"FireBulletEffect","Params":{"Id":130006001,"X":150,"Y":300,"Z":200}}"#);
+    let got = bullets(&mut h);
+    if role_nid > 0 {
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.OwnerEntityId, role_nid, "Player launcher fires from the role");
+    } else {
+        assert!(got.is_empty(), "no role entity: nothing to launch from");
+    }
+    assert!(got.iter().all(|(_, b)| b.OwnerEntityId != owner_nid));
 }
