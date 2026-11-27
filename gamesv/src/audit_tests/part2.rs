@@ -9368,3 +9368,71 @@ fn audit_154_fire_bullet_actions_push_create_bullet_notify() {
     }
     assert!(got.iter().all(|(_, b)| b.OwnerEntityId != owner_nid));
 }
+
+#[test]
+fn audit_155_killed_level_play_target_does_not_respawn_before_the_group_clears() {
+    use sonoro_gamesv_data::asset_indexes::entity_world_pos;
+
+    // MonsterTreasure 113000007 (map 8): node 2 is Kill with TargetsToAwake
+    // [133001904, 133001903, 133002077, 133002078]; its FinishActions unlock the chest 133002655.
+    // In the 2026-11-26 run these monsters came back 10-30 s after each kill: an active kill
+    // target skipped its 60 s respawn cooldown on the next spawn check.
+    const LP: i32 = 113_000_007;
+    const GROUP: [i32; 4] = [133_001_904, 133_001_903, 133_002_077, 133_002_078];
+
+    fn scan(h: &mut TestHarness, events: &mut EventQueue) {
+        events.enqueue(Event::SpatialSpawnsCheck {
+            player_id: h.state.player_id,
+        });
+        while let Some(ev) = events.dequeue() {
+            let mut rt = h.state.as_runtime(events, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("spatial spawns");
+        }
+        let _ = h.drain_count();
+    }
+
+    let mut h = TestHarness::new("audit155", Some(8));
+    let mut events = EventQueue::new();
+    let assets = Arc::clone(&h.state.assets);
+    let pos = entity_world_pos(&assets.find_level_entity(8, i64::from(GROUP[1])).unwrap()).unwrap();
+    h.state.scene.as_mut().unwrap().instance.players = vec![ScenePlayer {
+        id: h.state.player_id,
+        group_type: 1,
+        location: pos,
+        rotation: [0.0; 3],
+    }];
+    scan(&mut h, &mut events);
+    scan(&mut h, &mut events);
+    assert!(h.state.player_components.quest.info.progress.entered_level_plays.contains(&LP));
+
+    for (i, &cfg) in GROUP.iter().enumerate() {
+        let nid = h
+            .state
+            .scene
+            .as_ref()
+            .unwrap()
+            .find_entity_net_id_by_config_id(cfg)
+            .expect("group monster spawned");
+        // Same calls as the damage handler for a killed non-player target.
+        {
+            let mut qctx = h.state.quest_context(&mut events);
+            quest_engine::events::on_entity_killed(&mut qctx, nid, None).expect("quest kill");
+            let mut lp = level_play::LevelPlayContext::from_quest_ctx(&mut qctx).expect("lp ctx");
+            level_play::on_entity_killed_with_conditions(&mut lp, nid, None).expect("lp kill");
+        }
+        let _ = h.state.scene.as_mut().unwrap().remove(&h.state.fs, nid);
+        scan(&mut h, &mut events);
+        for &dead in &GROUP[..=i] {
+            assert!(
+                h.state.scene.as_ref().unwrap().find_entity_net_id_by_config_id(dead).is_none(),
+                "{dead} respawned after {} kill(s)",
+                i + 1
+            );
+        }
+    }
+    assert!(
+        h.state.player_components.quest.info.completed_level_plays.contains(&LP),
+        "the group clears on its fourth kill"
+    );
+}
+

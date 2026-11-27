@@ -3055,6 +3055,14 @@ pub fn collect_active_target_entity_ids(
                 continue;
             }
             for eid in quest_engine::extract_node_target_entity_ids(node) {
+                // A kill target already counted (`check_level_play_kill_progress`) is dead for
+                // this level play: as an active target it would skip its respawn cooldown and
+                // come back before the group is cleared.
+                if progress_comp
+                    .is_some_and(|pc| pc.info.has_claim(&lp_key("lp_kill", lp_id, eid)))
+                {
+                    continue;
+                }
                 out.insert(eid);
             }
         }
