@@ -9,9 +9,9 @@ use sonoro_proto::enums::{
     BtType, ChildQuestNodeStatus, ErrorCode, FailReason, GameCtxType, TimerSetType,
 };
 use sonoro_proto::pb::{
-    BtRollbackStartNotify, FlowEndNotify, FlowOptionInfoList, GameCtxPbCtxInfoOneof,
-    LordGymLevelPlayResultNotify, NormalInteractCtxPb,
-    QuestGiveUpNotify, TowerEndNotify, TowerFloorPb, TowerFloorUpdateNotify,
+    BtRollbackStartNotify, EntityCtxPb, EntityGroupActionCtxPb, EntityGroupFailureCtxPb,
+    FlowEndNotify, FlowOptionInfoList, GameCtxPbCtxInfoOneof, LordGymLevelPlayResultNotify,
+    NormalInteractCtxPb, QuestGiveUpNotify, TowerEndNotify, TowerFloorPb, TowerFloorUpdateNotify,
     TowerRolePb, UpdateChildQuestNodeStatusNotify, UpdateTimerInfoNotify,
 };
 
@@ -1056,6 +1056,15 @@ fn evaluate_entity_group_triggers_for_member<S: PushSink + ?Sized>(
     let mut cbs = super::action_callbacks::<S>();
     for spec in specs {
         let gid = spec.group_entity_id;
+        let group_entity_ctx = i32::try_from(gid).ok().and_then(|gid32| {
+            ctx.scene
+                .as_deref()
+                .and_then(|s| s.find_entity_net_id_by_config_id(gid32))
+                .map(|net_id| EntityCtxPb {
+                    ConfigId: gid32,
+                    IncId: net_id,
+                })
+        });
         if let Some(Value::Array(triggers)) = spec.component.StateTriggers.as_ref().map(|v| Value::Array(v.clone())).as_ref() {
             for (idx, trig) in triggers.iter().enumerate() {
                 let Some(tobj) = trig.as_object() else {
@@ -1076,19 +1085,59 @@ fn evaluate_entity_group_triggers_for_member<S: PushSink + ?Sized>(
                             pc.save(ctx.fs)?;
                         }
                         if let Some(Value::Array(acts)) = tobj.get("SuccessActions") {
+                            if let Some(ectx) = group_entity_ctx.clone() {
+                                push_entity_level_events(
+                                    ctx,
+                                    GameCtxType::EntityGroupAction,
+                                    GameCtxPbCtxInfoOneof::EntityGroupAction(
+                                        EntityGroupActionCtxPb {
+                                            EntityCtx: Some(ectx),
+                                            TriggerIndex: idx as i32,
+                                            IsMatch: true,
+                                        },
+                                    ),
+                                    acts,
+                                );
+                            }
                             quest_actions::execute_action_list(ctx, &mut cbs, 0, idx as i32, acts)?;
                             changed = true;
                         }
                     }
-                } else if let Some(Value::Array(fail_acts)) = tobj.get("FailActions")
-                    && !fail_acts.is_empty()
-                {
+                } else {
                     let was_triggered = ctx
                         .progress_comp
                         .as_deref()
                         .is_some_and(|pc| pc.info.has_claim(&format!("eg_trig:{gid}:{idx}")));
                     if was_triggered {
-                        quest_actions::execute_action_list(ctx, &mut cbs, 0, idx as i32, fail_acts)?;
+                        if let Some(pc) = ctx.progress_comp.as_deref_mut() {
+                            pc.info.remove_claim(&format!("eg_trig:{gid}:{idx}"));
+                            pc.save(ctx.fs)?;
+                        }
+                        if let Some(Value::Array(fail_acts)) = tobj.get("FailActions")
+                            && !fail_acts.is_empty()
+                        {
+                            if let Some(ectx) = group_entity_ctx.clone() {
+                                push_entity_level_events(
+                                    ctx,
+                                    GameCtxType::EntityGroupAction,
+                                    GameCtxPbCtxInfoOneof::EntityGroupAction(
+                                        EntityGroupActionCtxPb {
+                                            EntityCtx: Some(ectx),
+                                            TriggerIndex: idx as i32,
+                                            IsMatch: false,
+                                        },
+                                    ),
+                                    fail_acts,
+                                );
+                            }
+                            quest_actions::execute_action_list(
+                                ctx,
+                                &mut cbs,
+                                0,
+                                idx as i32,
+                                fail_acts,
+                            )?;
+                        }
                         changed = true;
                     }
                 }
@@ -1152,7 +1201,21 @@ fn evaluate_entity_group_triggers_for_member<S: PushSink + ?Sized>(
                 }
             }
             if failed && let Some(ops) = fl_obj.get("FailureOperations").and_then(Value::as_object) {
-                if let Some(Value::Array(acts)) = ops.get("Actions") {
+                if let Some(Value::Array(acts)) = ops.get("Actions")
+                    && !acts.is_empty()
+                {
+                    if let Some(ectx) = group_entity_ctx {
+                        push_entity_level_events(
+                            ctx,
+                            GameCtxType::EntityGroupFailureAction,
+                            GameCtxPbCtxInfoOneof::EntityGroupFailureAction(
+                                EntityGroupFailureCtxPb {
+                                    EntityCtx: Some(ectx),
+                                },
+                            ),
+                            acts,
+                        );
+                    }
                     quest_actions::execute_action_list(ctx, &mut cbs, 0, 0, acts)?;
                     changed = true;
                 }

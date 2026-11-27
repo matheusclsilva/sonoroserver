@@ -7560,3 +7560,102 @@ fn audit_141_dynamic_interact_actions_push_dynamic_interact_action_notify() {
         Some(GameCtxType::DoInteractChildQuestNode)
     );
 }
+
+#[test]
+fn audit_142_entity_group_fail_actions_run_once_and_push_entity_group_action_notify() {
+    use sonoro_gamesv_logic::helpers::quest_actions;
+    use sonoro_gamesv_logic::helpers::quest_engine;
+    use sonoro_proto::PbMessage;
+    use sonoro_proto::enums::GameCtxType;
+    use sonoro_proto::pb::{ActionNotify, GameCtxPbCtxInfoOneof};
+
+    // Map 8 EntityGroup 106800021 watches [106003094, 106003095, 106003096] -> 激活:
+    // SuccessActions: UnlockEntity([106003111]); FailActions: LockEntity([106003111]).
+    const GROUP_CFG: i32 = 106_800_021;
+    const MEMBERS: [i32; 3] = [106_003_094, 106_003_095, 106_003_096];
+
+    let mut h = TestHarness::new("audit142", Some(8));
+    let group_nid = {
+        let mut st = EntityComponentStorage::new(
+            0,
+            ConfigComponent {
+                camp: 0,
+                config_id: GROUP_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::SceneItem,
+                state: EntityState::Default,
+            },
+        );
+        st.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        h.state.scene.as_mut().unwrap().spawn(st).net_id
+    };
+    let _ = h.drain_count();
+
+    let set_member_state = |h: &mut TestHarness, eid: i32, st: &str| {
+        let mut evq = EventQueue::new();
+        {
+            let mut qctx = h.state.quest_context(&mut evq);
+            let cbs = quest_engine::action_callbacks();
+            quest_actions::apply_entity_state_change(&mut qctx, &cbs, eid, st)
+                .expect("apply member state");
+        }
+        while let Some(ev) = evq.dequeue() {
+            let mut rt = h.state.as_runtime(&mut evq, None);
+            sonoro_gamesv_logic::handlers::dispatch_event(&mut rt, ev).expect("dispatch");
+        }
+    };
+
+    let drain_eg_notifies = |h: &mut TestHarness| -> Vec<(i32, bool)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = h.rx.try_recv() {
+            if frame.len() < 3 {
+                continue;
+            }
+            if let Ok(msg) = super::Message::decode(&frame[3..])
+                && msg.header.message_id() == ActionNotify::MSG_ID
+                && let Ok(n) = ActionNotify::decode(&msg.payload)
+                && let Some(GameCtxPbCtxInfoOneof::EntityGroupAction(eg)) =
+                    n.GameCtx.as_ref().and_then(|g| g.CtxInfo.as_ref())
+                && n.GameCtx.as_ref().and_then(|g| g.CtxType) == Some(GameCtxType::EntityGroupAction)
+                && eg.EntityCtx.as_ref().map(|e| e.IncId) == Some(group_nid)
+            {
+                out.push((eg.TriggerIndex, eg.IsMatch));
+            }
+        }
+        out
+    };
+
+    // 1. Activate all 3 members -> SuccessActions fires once with IsMatch = true.
+    for eid in MEMBERS {
+        set_member_state(&mut h, eid, "关卡.Common.状态.激活");
+    }
+    assert_eq!(drain_eg_notifies(&mut h), vec![(0, true)]);
+    assert!(
+        h.state
+            .player_components
+            .progress
+            .info
+            .has_claim(&format!("eg_trig:{GROUP_CFG}:0"))
+    );
+
+    // 2. Revert member 0 -> FailActions fires ONCE with IsMatch = false, and claim is cleared.
+    set_member_state(&mut h, MEMBERS[0], "关卡.Common.状态.常态");
+    assert_eq!(drain_eg_notifies(&mut h), vec![(0, false)]);
+    assert!(
+        !h.state
+            .player_components
+            .progress
+            .info
+            .has_claim(&format!("eg_trig:{GROUP_CFG}:0"))
+    );
+
+    // 3. Revert member 1 -> FailActions must NOT re-run on subsequent unmatched evaluations.
+    set_member_state(&mut h, MEMBERS[1], "关卡.Common.状态.常态");
+    assert!(
+        drain_eg_notifies(&mut h).is_empty(),
+        "FailActions must not re-run when trigger was already unmatched"
+    );
+}
