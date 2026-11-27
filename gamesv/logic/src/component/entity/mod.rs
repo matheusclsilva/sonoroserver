@@ -72,6 +72,8 @@ pub struct WorldItemState {
     pub durability: i32,
     pub drop_item_id: i32,
     pub drop_item_count: i32,
+    /// SceneItemLifeCycleComponent.CreateStageConfig already ran for this spawn.
+    pub lifecycle_create_done: bool,
     pub in_range_entity_ids: [i64; 8],
     pub in_range_entity_len: u8,
     pub be_controlled_player_id: Option<i64>,
@@ -122,6 +124,7 @@ impl Default for WorldItemState {
             durability: 0,
             drop_item_id: 0,
             drop_item_count: 1,
+            lifecycle_create_done: false,
             in_range_entity_ids: [0; 8],
             in_range_entity_len: 0,
             be_controlled_player_id: None,

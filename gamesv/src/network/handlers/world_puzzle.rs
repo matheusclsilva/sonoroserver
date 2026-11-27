@@ -1051,9 +1051,11 @@ pub fn handle_set_init_tag_request(
     req: SetInitTagRequest,
 ) -> Result<SetInitTagResponse, String> {
     let claim_key = format!("init_tag:{}", req.EntityId);
-    let already_init = state.player_components.progress.info.has_claim(&claim_key);
     pb_kv::persist_claim(&state.fs, &mut state.player_components.progress, &claim_key)
         .map_err(|e| e.to_string())?;
+    // CreateStageConfig runs once per spawned entity: net ids restart every session, so the
+    // persisted init_tag claim cannot tell a new spawn from a repeat request.
+    let mut already_init = true;
     let mut resolved: Option<(i64, i32, i32)> = None;
     if let Some(scene) = state.scene.as_mut() {
         let nid_opt = if scene.net_id_map.contains_key(&req.EntityId) {
@@ -1067,6 +1069,10 @@ pub fn handle_set_init_tag_request(
             let cfg_id = scene.find_config_id_by_net_id(nid).unwrap_or(0);
             let map_id = state.assets.resolve_map_config_id(scene.instance_id);
             resolved = Some((nid, cfg_id, map_id));
+            if let Some(storage) = scene.entity_mut(nid) {
+                already_init = storage.world_item.lifecycle_create_done;
+                storage.world_item.lifecycle_create_done = true;
+            }
             if let Some(upd) = scene.update_entity_state_tag(
                 &state.assets.tables.gameplay_tag_remap,
                 nid,

@@ -7740,6 +7740,56 @@ fn audit_143_set_init_tag_runs_lifecycle_create_stage_actions_once() {
         "CreateStageConfig must run only on initial SetInitTagRequest"
     );
 
+    // 2b. Next session: net ids restart, so a new spawn reuses the old net id while the
+    //     persisted init_tag claim is still saved. Its CreateStageConfig must run again.
+    let _ = h.state.scene.as_mut().unwrap().remove(&h.state.fs, source_nid);
+    let respawned = {
+        let mut st = EntityComponentStorage::new(
+            source_nid,
+            ConfigComponent {
+                camp: 0,
+                config_id: SOURCE_CFG,
+                config_type: ConfigType::Level,
+                entity_type: EntityType::SceneItem,
+                state: EntityState::Default,
+            },
+        );
+        st.position = Some(PositionComponent {
+            location: [0.0; 3],
+            rotation: [0.0; 3],
+        });
+        h.state
+            .scene
+            .as_mut()
+            .unwrap()
+            .spawn_with_net_id(source_nid, st)
+            .expect("respawn with the old net id")
+            .net_id
+    };
+    assert!(
+        h.state
+            .player_components
+            .progress
+            .info
+            .has_claim(&format!("init_tag:{respawned}"))
+    );
+    world_puzzle::handle_set_init_tag_request(
+        &mut h.state,
+        SetInitTagRequest {
+            EntityId: respawned,
+        },
+    )
+    .expect("SetInitTagRequest after respawn");
+    assert_eq!(
+        h.state
+            .player_components
+            .quest
+            .info
+            .get_entity_state(i64::from(TARGET_CFG)),
+        Some("关卡.Common.状态.常态"),
+        "a new spawn runs CreateStageConfig even if an old claim has its net id"
+    );
+
     // 3. Verify SceneItemLifeCycleComponentCreate ActionNotify builds cleanly for client actions.
     let _ = h.drain_count();
     {
