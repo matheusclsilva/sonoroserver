@@ -9,7 +9,7 @@ use sonoro_gamesv_logic::helpers::{
     consume::{self, CostItem},
     destructible,
     energy, level_play::{self, LevelPlayContext},
-    quest_actions, quest_engine, role as role_helper,
+    quest_actions, quest_engine, reward, role as role_helper,
 };
 use sonoro_proto::enums::{BuffOperateType, EAttributeType, ErrorCode, LivingStatus};
 use sonoro_proto::pb::{
@@ -1284,6 +1284,8 @@ pub fn handle_throw_damage_request(
     let mut max_dur = 1i32;
     let mut hit_damage = 1i32;
     let mut found_in_scene = false;
+    let mut destruction_reward = None;
+    let mut reward_refreshes = false;
 
     if let Some(scene) = state.scene.as_ref() {
         if let Some(cid) = scene.find_config_id_by_net_id(eid) {
@@ -1306,6 +1308,13 @@ pub fn handle_throw_damage_request(
                 di.WeaponDamage.as_ref(),
                 current_role_weapon_kind(scene, &state.assets),
             );
+            destruction_reward =
+                destructible::destruction_reward_id(res.components.RewardComponent.as_ref());
+            reward_refreshes = res
+                .components
+                .RefreshComponent
+                .as_ref()
+                .is_some_and(|rc| !rc.Disabled.unwrap_or(false));
         }
     }
 
@@ -1384,6 +1393,11 @@ pub fn handle_throw_damage_request(
         } else {
             None
         };
+        if let Some(cid32) = state_upd
+            && let Some(reward_id) = destruction_reward
+        {
+            grant_destruction_reward(state, cid32, reward_id, reward_refreshes)?;
+        }
         if let Some(cid32) = state_upd {
             let mut qctx = state.quest_context(events);
             let _ = quest_engine::events::on_entity_state_changed(
@@ -1406,6 +1420,50 @@ pub fn handle_throw_damage_request(
     Ok(ThrowDamageResponse {
         ErrorCode: Some(ErrorCode::Success),
     })
+}
+
+/// Same window the Collect interaction gives a refreshing collectible
+/// (`apply_interact_collect_or_reward`).
+const DESTRUCTIBLE_RESPAWN_MS: i64 = 300_000;
+
+/// Pays a destroyed destructible's `RewardComponent` once: a refreshing one goes on the
+/// respawn cooldown, a one-off one is marked taken, as the Collect interaction does.
+fn grant_destruction_reward(
+    state: &mut State,
+    cfg_id: i32,
+    reward_id: i32,
+    refreshes: bool,
+) -> Result<(), String> {
+    let now_ms = sonoro_gamesv_logic::scene::now_millis();
+    let taken = state.player_components.quest.info.has_opened_chest(cfg_id)
+        || state
+            .scene
+            .as_ref()
+            .is_some_and(|s| s.instance.is_on_respawn_cooldown(cfg_id, now_ms));
+    if taken {
+        return Ok(());
+    }
+    {
+        let mut rctx = state.reward_context();
+        reward::grant_world_pickup_drop_package(&mut rctx, reward_id, 1)
+            .map_err(|e| e.to_string())?;
+    }
+    if refreshes {
+        if let Some(scene) = state.scene.as_mut() {
+            scene
+                .instance
+                .set_respawn_cooldown(cfg_id, now_ms, now_ms + DESTRUCTIBLE_RESPAWN_MS);
+            scene.save_persistent(&state.fs).map_err(|e| e.to_string())?;
+        }
+    } else {
+        state.player_components.quest.info.mark_chest_opened(cfg_id);
+        state
+            .player_components
+            .quest
+            .save(&state.fs)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn handle_explore_skill_action_request(

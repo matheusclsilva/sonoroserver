@@ -8898,3 +8898,126 @@ fn audit_149_world_collect_drop_shows_item_hint_without_popup() {
         "grant_drop_package without the world-pickup path keeps NoTips true"
     );
 }
+
+#[test]
+fn audit_150_destroyed_destructible_pays_its_reward_once() {
+    use sonoro_gamesv_logic::commands::entity as entity_cmd;
+    use sonoro_proto::pb::{NormalItemAddNotify, NormalItemUpdateNotify, ThrowDamageRequest};
+
+    // Collect501 104000326 (红针晶簇 ore): Durability 300, WeaponDamage DefaultValue 100,
+    // RewardComponent {RewardId 2701, RewardType 0 = Nearby}, RefreshComponent present.
+    // DropPackage 2701: ShowBg false, DropPreview {42500010: 1}.
+    const ORE_CFG: i64 = 104_000_326;
+    const ORE_ITEM: i32 = 42_500_010;
+
+    fn drain_raw(h: &mut TestHarness) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = h.rx.try_recv() {
+            if frame.len() >= 3
+                && let Ok(msg) = super::Message::decode(&frame[3..])
+            {
+                out.push((msg.header.message_id(), msg.payload));
+            }
+        }
+        out
+    }
+    fn of<M: sonoro_proto::PbMessage>(frames: &[(u16, Vec<u8>)], msg_id: u16) -> Vec<M> {
+        frames
+            .iter()
+            .filter(|(id, _)| *id == msg_id)
+            .filter_map(|(_, payload)| M::decode(payload).ok())
+            .collect()
+    }
+    fn ore_item_notifies(frames: &[(u16, Vec<u8>)]) -> Vec<bool> {
+        let adds = of::<NormalItemAddNotify>(frames, NormalItemAddNotify::MSG_ID)
+            .into_iter()
+            .filter(|n| n.NormalItemList.iter().any(|it| it.Id == ORE_ITEM))
+            .map(|n| n.NoTips);
+        let updates = of::<NormalItemUpdateNotify>(frames, NormalItemUpdateNotify::MSG_ID)
+            .into_iter()
+            .filter(|n| n.NormalItemList.iter().any(|it| it.Id == ORE_ITEM))
+            .map(|n| n.NoTips);
+        adds.chain(updates).collect()
+    }
+    fn spawn_ore(h: &mut TestHarness, events: &mut EventQueue) -> i64 {
+        entity_cmd::spawn_with_location(
+            events,
+            h.state.scene.as_mut().unwrap(),
+            &h.state.fs,
+            &h.state.assets,
+            &mut h.state.conn,
+            &h.state.player_components.basic,
+            ORE_CFG,
+            Some(false),
+            Some(false),
+            Some(8),
+            Some([0.0, 0.0, 0.0]),
+            true,
+        )
+        .expect("spawn ore");
+        h.state
+            .scene
+            .as_ref()
+            .unwrap()
+            .find_entity_net_id_by_config_id(i32::try_from(ORE_CFG).unwrap())
+            .expect("ore net id")
+    }
+    fn break_ore(h: &mut TestHarness, events: &mut EventQueue, net_id: i64) {
+        for _ in 0..3 {
+            let resp = combat_sync::handle_throw_damage_request(
+                &mut h.state,
+                events,
+                ThrowDamageRequest {
+                    EntityId: net_id,
+                    ..Default::default()
+                },
+            )
+            .expect("throw damage");
+            assert_eq!(resp.ErrorCode, Some(ErrorCode::Success));
+        }
+        assert!(
+            h.state.scene.as_ref().unwrap().entity(net_id).is_none(),
+            "three 100-damage hits destroy a 300-durability ore"
+        );
+    }
+
+    let mut h = TestHarness::new("audit150", Some(8));
+    let mut events = EventQueue::new();
+    let cfg32 = i32::try_from(ORE_CFG).unwrap();
+
+    // 1. Breaking the ore pays DropPackage 2701 and shows it in the item hint.
+    let ore = spawn_ore(&mut h, &mut events);
+    let _ = h.drain_count();
+    break_ore(&mut h, &mut events, ore);
+    let frames = drain_raw(&mut h);
+    let notifies = ore_item_notifies(&frames);
+    assert_eq!(notifies, vec![false], "one ore item, listed in the item hint");
+    assert!(
+        h.state
+            .player_components
+            .inventory
+            .info
+            .normal_item_count(ORE_ITEM)
+            >= 1,
+        "the ore item must be in the bag"
+    );
+    assert!(
+        h.state
+            .scene
+            .as_ref()
+            .unwrap()
+            .instance
+            .is_on_respawn_cooldown(cfg32, sonoro_gamesv_logic::scene::now_millis()),
+        "a refreshing ore goes on the respawn cooldown"
+    );
+
+    // 2. Breaking it again inside the cooldown pays nothing more.
+    let ore_again = spawn_ore(&mut h, &mut events);
+    let _ = h.drain_count();
+    break_ore(&mut h, &mut events, ore_again);
+    let frames = drain_raw(&mut h);
+    assert!(
+        ore_item_notifies(&frames).is_empty(),
+        "no second reward while the ore is on its respawn cooldown"
+    );
+}

@@ -64,6 +64,28 @@ pub fn after_hit(current: i32, damage: i32) -> i32 {
     (current - damage).max(0)
 }
 
+/// `Aki.TDConfigMgr.Component.ERewardType`: Nearby, Owner, Collect, HostInteract.
+const REWARD_TYPE_NEARBY: i32 = 0;
+const REWARD_TYPE_OWNER: i32 = 1;
+
+/// The drop a destructible pays when its durability reaches zero. `Nearby` and `Owner`
+/// rewards belong to the destruction (rocks, crates); `Collect` and `HostInteract` rewards
+/// are paid by an interaction instead.
+pub fn destruction_reward_id(
+    reward: Option<&sonoro_gamesv_data::tables::entity_components::reward::RewardComponent>,
+) -> Option<i32> {
+    let rc = reward?;
+    if rc.Disabled.unwrap_or(false) {
+        return None;
+    }
+    let reward_id = rc.RewardId.unwrap_or(0);
+    let on_destruction = matches!(
+        rc.RewardType.unwrap_or(REWARD_TYPE_NEARBY),
+        REWARD_TYPE_NEARBY | REWARD_TYPE_OWNER
+    );
+    (reward_id > 0 && on_destruction).then_some(reward_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +129,26 @@ mod tests {
         assert_eq!(hit_damage(None, WeaponKind::Dagger), DEFAULT_HIT_DAMAGE);
         assert_eq!(after_hit(100, 100), 0);
         assert_eq!(after_hit(1, 100), 0);
+    }
+
+    #[test]
+    fn destruction_reward_only_for_nearby_and_owner_rewards() {
+        use sonoro_gamesv_data::tables::entity_components::reward::RewardComponent;
+
+        let reward = |id: Option<i32>, ty: Option<i32>, disabled: Option<bool>| RewardComponent {
+            RewardId: id,
+            RewardType: ty,
+            Disabled: disabled,
+        };
+        // Collect501 ore: {"RewardId": 2701, "RewardType": 0}.
+        assert_eq!(destruction_reward_id(Some(&reward(Some(2701), Some(0), None))), Some(2701));
+        assert_eq!(destruction_reward_id(Some(&reward(Some(2202), None, None))), Some(2202));
+        assert_eq!(destruction_reward_id(Some(&reward(Some(1315), Some(1), None))), Some(1315));
+        // Collect001 plant: {"RewardId": 2401, "RewardType": 2} is paid by the Collect action.
+        assert_eq!(destruction_reward_id(Some(&reward(Some(2401), Some(2), None))), None);
+        assert_eq!(destruction_reward_id(Some(&reward(Some(2401), Some(3), None))), None);
+        assert_eq!(destruction_reward_id(Some(&reward(Some(2701), Some(0), Some(true)))), None);
+        assert_eq!(destruction_reward_id(Some(&reward(None, Some(0), None))), None);
+        assert_eq!(destruction_reward_id(None), None);
     }
 }
